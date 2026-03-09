@@ -14,7 +14,7 @@ Quick start:
     context = await assembler.build_context("what Python version?")
 """
 
-from nous.store import MemoryStore
+from nous.store import MemoryStore, extract_search_queries
 from nous.context import ContextAssembler
 from nous.embeddings import EmbeddingProvider, OllamaEmbedder, NullEmbedder
 from nous.types import Memory, WorkerShell, SearchResult, MemoryCategory, MemoryTier
@@ -23,6 +23,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "MemoryStore",
+    "extract_search_queries",
     "ContextAssembler",
     "EmbeddingProvider",
     "OllamaEmbedder",

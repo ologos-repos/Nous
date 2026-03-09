@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,88 @@ from nous.types import (
 from nous.vectors import cosine_similarity, deserialize_vector, serialize_vector
 
 logger = logging.getLogger(__name__)
+
+# ─── Search Query Utilities ────────────────────────────────────────────────────
+
+_STOP_WORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "is", "it", "in", "on", "at", "to", "for", "of",
+    "and", "or", "but", "not", "with", "from", "by", "as", "was", "were",
+    "been", "be", "are", "do", "does", "did", "have", "has", "had", "will",
+    "would", "could", "should", "can", "may", "might", "shall", "i", "you",
+    "he", "she", "we", "they", "me", "him", "her", "us", "them", "my",
+    "your", "his", "its", "our", "their", "this", "that", "these", "those",
+    "what", "which", "who", "whom", "how", "when", "where", "why", "if",
+    "then", "than", "so", "no", "yes", "up", "out", "about", "just", "also",
+    "very", "really", "before", "after", "into", "over", "such", "some",
+    "any", "all", "each", "every", "both", "few", "more", "most", "other",
+    "only", "own", "same", "too", "here", "there", "again", "once", "being",
+    "doing",
+})
+
+
+def extract_search_queries(text: str) -> list[str]:
+    """
+    Generate 1-3 search queries from a user message.
+
+    Always includes the original text. Attempts to extract key phrases,
+    technical terms, and significant keywords to broaden recall coverage.
+
+    Args:
+        text: The input query text
+
+    Returns:
+        List of 1-3 deduplicated search queries
+    """
+    queries: list[str] = [text]
+
+    key_phrases: list[str] = []
+
+    # Multi-word capitalized sequences (e.g. "Centauri Carbon", "Memory Store")
+    for match in re.finditer(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', text):
+        key_phrases.append(match.group(1))
+
+    # Quoted strings
+    for match in re.finditer(r'"([^"]+)"|\'([^\']+)\'', text):
+        phrase = match.group(1) or match.group(2)
+        if phrase:
+            key_phrases.append(phrase)
+
+    # Technical terms (words with dots/hyphens/underscores)
+    for match in re.finditer(r'\b[\w][\w.-]*[-._][\w.-]*[\w]\b', text):
+        key_phrases.append(match.group(0))
+
+    # Single capitalized words not in stop words
+    for match in re.finditer(r'\b([A-Z][a-z]+)\b', text):
+        word = match.group(1)
+        if word.lower() not in _STOP_WORDS:
+            key_phrases.append(word)
+
+    if key_phrases:
+        # Use the first/best key phrase as a focused query
+        candidate = key_phrases[0]
+        if candidate.lower() != text.lower():
+            queries.append(candidate)
+
+    # Significant keywords (words >4 chars, not stop words)
+    words = re.findall(r'\b\w+\b', text.lower())
+    significant = [w for w in words if len(w) > 4 and w not in _STOP_WORDS]
+    if significant:
+        keyword_query = " ".join(significant)
+        if keyword_query.lower() != text.lower() and keyword_query not in queries:
+            queries.append(keyword_query)
+
+    # Deduplicate and cap at 3
+    seen: set[str] = set()
+    result: list[str] = []
+    for q in queries:
+        normalized = q.strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+        if len(result) >= 3:
+            break
+
+    return result
 
 
 class MemoryStore:
@@ -254,10 +337,14 @@ class MemoryStore:
         query: str,
         category: str | None = None,
         limit: int = 10,
-        threshold: float = 0.4,
+        threshold: float = 0.3,
     ) -> list[SearchResult]:
         """
-        Search director memory (Tier 1). Uses semantic search with keyword fallback.
+        Search director memory (Tier 1). Uses multi-query hybrid search.
+
+        Generates 1-3 search queries from the input, runs hybrid recall (semantic
+        + OR-keyword + recency boost) for each, deduplicates by memory ID keeping
+        the highest score, and returns the top results.
 
         Args:
             query: Search query
@@ -268,17 +355,23 @@ class MemoryStore:
         Returns:
             List of SearchResult objects sorted by relevance
         """
-        # Try semantic search first
-        if not isinstance(self._embedder, NullEmbedder):
-            try:
-                results = await self._semantic_recall(query, category, limit, threshold)
-                if results:
-                    return results
-            except Exception as e:
-                logger.warning(f"Semantic search failed, falling back to keyword: {e}")
+        queries = extract_search_queries(query)
+        merged: dict[int, SearchResult] = {}
 
-        # Keyword fallback
-        return await self._keyword_recall(query, category, limit)
+        for q in queries:
+            try:
+                results = await self.hybrid_recall(
+                    q, category=category, limit=limit, threshold=threshold
+                )
+                for sr in results:
+                    existing = merged.get(sr.memory.id)
+                    if existing is None or sr.score > existing.score:
+                        merged[sr.memory.id] = sr
+            except Exception as e:
+                logger.warning(f"hybrid_recall failed for query '{q}': {e}")
+
+        sorted_results = sorted(merged.values(), key=lambda r: r.score, reverse=True)
+        return sorted_results[:limit]
 
     async def _semantic_recall(
         self,
@@ -371,6 +464,159 @@ class MemoryStore:
             results.append(SearchResult(memory=memory, score=max(score, 0.1), match_type="keyword"))
 
         return results
+
+    async def _keyword_recall_or(
+        self,
+        query: str,
+        category: str | None,
+        limit: int,
+    ) -> list[SearchResult]:
+        """
+        OR-style keyword search — any word match scores a result.
+
+        Unlike _keyword_recall() which requires ALL words to match (AND), this
+        method returns results that match ANY significant word. Results are scored
+        by the fraction of query words found in the content.
+
+        Falls back to _keyword_recall() if no significant words are found.
+        """
+        words = re.findall(r'\b\w+\b', query.lower())
+        significant = [w for w in words if len(w) > 2 and w not in _STOP_WORDS]
+
+        if not significant:
+            return await self._keyword_recall(query, category, limit)
+
+        total_words = len(significant)
+
+        # Build OR conditions with asyncpg $N placeholders
+        conditions = [f"LOWER(content) LIKE ${i + 1}" for i in range(len(significant))]
+        params: list[Any] = [f"%{w}%" for w in significant]
+
+        if category:
+            conditions.append(f"category = ${len(significant) + 1}")
+            params.append(category)
+
+        where = "(" + " OR ".join(conditions[:len(significant)]) + ")"
+        if category:
+            where += f" AND category = ${len(significant) + 1}"
+
+        fetch_limit = limit * 3
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""SELECT id, content, category, metadata, created_at, updated_at
+                    FROM director_memory
+                    WHERE {where}
+                    ORDER BY created_at DESC
+                    LIMIT {fetch_limit}""",
+                *params,
+            )
+
+        results = []
+        for row in rows:
+            content_lower = row["content"].lower()
+            matched = sum(1 for w in significant if w in content_lower)
+            score = (matched / total_words) * 0.7
+            if score <= 0:
+                continue
+            memory = Memory(
+                id=row["id"],
+                content=row["content"],
+                category=row["category"],
+                tier=MemoryTier.DIRECTOR,
+                metadata=dict(row["metadata"]) if row["metadata"] else {},
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            results.append(SearchResult(memory=memory, score=score, match_type="keyword"))
+
+        results.sort(key=lambda r: r.score, reverse=True)
+        return results[:limit]
+
+    async def hybrid_recall(
+        self,
+        query: str,
+        category: str | None = None,
+        limit: int = 15,
+        threshold: float = 0.3,
+        recency_boost_hours: float = 24.0,
+        recency_boost_value: float = 0.1,
+    ) -> list[SearchResult]:
+        """
+        Hybrid semantic + keyword recall with recency boost.
+
+        Combines semantic similarity (when embeddings are available) with
+        OR-style keyword search, deduplicates by memory ID keeping the highest
+        score, then applies a recency boost for recent memories.
+
+        Args:
+            query: Search query
+            category: Optional category filter
+            limit: Maximum results to return
+            threshold: Minimum score for semantic results
+            recency_boost_hours: Hours within which memories get a boost
+            recency_boost_value: Score bonus for recent memories (capped at 1.0)
+
+        Returns:
+            List of SearchResult objects sorted by score descending
+        """
+        merged: dict[int, SearchResult] = {}
+
+        # Semantic search (if embedder is available)
+        if not isinstance(self._embedder, NullEmbedder):
+            try:
+                semantic_results = await self._semantic_recall(
+                    query, category, limit * 2, threshold
+                )
+                for sr in semantic_results:
+                    merged[sr.memory.id] = sr
+            except Exception as e:
+                logger.warning(f"Semantic search failed in hybrid_recall: {e}")
+
+        # OR-style keyword search
+        try:
+            keyword_results = await self._keyword_recall_or(query, category, limit)
+            for sr in keyword_results:
+                existing = merged.get(sr.memory.id)
+                if existing is None or sr.score > existing.score:
+                    # Mark as hybrid if it also appeared in semantic results
+                    match_type = "hybrid" if sr.memory.id in merged else "keyword"
+                    merged[sr.memory.id] = SearchResult(
+                        memory=sr.memory,
+                        score=sr.score,
+                        match_type=match_type,
+                    )
+                elif existing is not None:
+                    # It was already semantic — upgrade to hybrid
+                    merged[sr.memory.id] = SearchResult(
+                        memory=existing.memory,
+                        score=existing.score,
+                        match_type="hybrid",
+                    )
+        except Exception as e:
+            logger.warning(f"Keyword search failed in hybrid_recall: {e}")
+
+        # Apply recency boost
+        now = datetime.now(timezone.utc)
+        boost_cutoff = timedelta(hours=recency_boost_hours)
+        boosted: list[SearchResult] = []
+        for sr in merged.values():
+            score = sr.score
+            if sr.memory.created_at:
+                created = sr.memory.created_at
+                # Ensure timezone-aware for comparison
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                if (now - created) < boost_cutoff:
+                    score = min(1.0, score + recency_boost_value)
+            boosted.append(SearchResult(
+                memory=sr.memory,
+                score=score,
+                match_type=sr.match_type,
+            ))
+
+        boosted.sort(key=lambda r: r.score, reverse=True)
+        return boosted[:limit]
 
     async def forget(self, memory_id: int) -> bool:
         """Delete a specific director memory by ID."""
