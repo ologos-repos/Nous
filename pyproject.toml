@@ -1,0 +1,63 @@
+[project]
+name = "nous-memory"
+version = "0.1.0"
+description = "Persistent agent memory architecture — three-tier memory, hybrid PostgreSQL+SQLite, embedded vector retrieval, multi-agent isolation."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Ologos", email = "ologos@proton.me" }
+]
+keywords = ["ai", "agent", "memory", "llm", "rag", "embeddings", "multi-agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "asyncpg>=0.30.0",
+    "aiosqlite>=0.20.0",
+]
+
+[project.optional-dependencies]
+ollama = ["httpx>=0.27.0"]
+openai = ["openai>=1.0.0"]
+all = ["httpx>=0.27.0", "openai>=1.0.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ologos-repos/Nous"
+Documentation = "https://github.com/ologos-repos/Nous/tree/main/docs"
+Repository = "https://github.com/ologos-repos/Nous"
+Issues = "https://github.com/ologos-repos/Nous/issues"
+
+[project.scripts]
+nous-setup = "nous.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nous"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

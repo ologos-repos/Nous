@@ -1,0 +1,1201 @@
+"""
+Nous MemoryStore — the hybrid PostgreSQL + SQLite storage layer.
+
+This is the central interface for all memory operations. It manages:
+- Tier 1: Director memory (PostgreSQL, curated, embedded)
+- Tier 2: Worker shared memory (PostgreSQL, name-scoped)
+- Tier 3: Worker private shells (per-worker SQLite databases)
+- Conversation log (PostgreSQL)
+- Worker resumes / history (PostgreSQL)
+
+Usage:
+    store = await MemoryStore.connect(
+        postgres_url="postgresql://user:pass@localhost/nous",
+        shell_dir="./shells",
+    )
+
+    # Director memory (Tier 1)
+    await store.remember("important fact", category="decision")
+    results = await store.recall("what was that decision?")
+
+    # Worker shared memory (Tier 2)
+    await store.worker_remember("alpha", "found a bug in auth", category="lesson")
+    results = await store.worker_recall("alpha", "auth bug")
+
+    # Worker private shell (Tier 3)
+    shell = store.get_shell("alpha")
+    await shell.remember("private note", importance=0.8)
+
+    # Conversation log
+    await store.log_conversation("user", "hello")
+    turns = await store.get_recent_conversations(limit=20)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from nous.embeddings import EmbeddingProvider, NullEmbedder
+from nous.types import (
+    ConversationTurn,
+    Memory,
+    MemoryTier,
+    RetentionPolicy,
+    SearchResult,
+    WorkerResume,
+    WorkerShell,
+)
+from nous.vectors import cosine_similarity, deserialize_vector, serialize_vector
+
+logger = logging.getLogger(__name__)
+
+
+class MemoryStore:
+    """
+    Hybrid PostgreSQL + SQLite memory store.
+
+    PostgreSQL holds shared state (director memory, conversations, worker shared memory,
+    resumes). Per-worker SQLite databases hold private state (shell memories, knowledge,
+    instructions, training data).
+    """
+
+    def __init__(
+        self,
+        pg_pool: Any,  # asyncpg.Pool
+        shell_dir: str | Path,
+        embedder: EmbeddingProvider | None = None,
+    ):
+        self._pool = pg_pool
+        self._shell_dir = Path(shell_dir)
+        self._shell_dir.mkdir(parents=True, exist_ok=True)
+        self._embedder = embedder or NullEmbedder()
+        self._shells: dict[str, ShellStore] = {}
+
+    @classmethod
+    async def connect(
+        cls,
+        postgres_url: str,
+        shell_dir: str | Path = "./shells",
+        embedder: EmbeddingProvider | None = None,
+        min_pool_size: int = 2,
+        max_pool_size: int = 10,
+        run_migrations: bool = True,
+    ) -> MemoryStore:
+        """
+        Connect to PostgreSQL and initialize the memory store.
+
+        Args:
+            postgres_url: PostgreSQL connection string
+            shell_dir: Directory for per-worker SQLite databases
+            embedder: Embedding provider (default: NullEmbedder for keyword-only search)
+            min_pool_size: Minimum connections in the pool
+            max_pool_size: Maximum connections in the pool
+            run_migrations: Whether to create tables on connect (default: True)
+
+        Returns:
+            Connected MemoryStore instance
+        """
+        import asyncpg
+
+        pool = await asyncpg.create_pool(
+            postgres_url,
+            min_size=min_pool_size,
+            max_size=max_pool_size,
+        )
+
+        store = cls(pg_pool=pool, shell_dir=shell_dir, embedder=embedder)
+
+        if run_migrations:
+            await store._run_migrations()
+
+        return store
+
+    async def close(self):
+        """Close all connections."""
+        for shell in self._shells.values():
+            await shell.close()
+        self._shells.clear()
+        await self._pool.close()
+
+    # ─── Schema Migrations ─────────────────────────────────────────────
+
+    async def _run_migrations(self):
+        """Create tables if they don't exist."""
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS director_memory (
+                    id SERIAL PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    category TEXT DEFAULT 'general',
+                    embedding BYTEA DEFAULT NULL,
+                    embedding_model TEXT DEFAULT NULL,
+                    metadata JSONB DEFAULT '{}',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id SERIAL PRIMARY KEY,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS worker_memory (
+                    id SERIAL PRIMARY KEY,
+                    worker_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    category TEXT DEFAULT 'general',
+                    metadata JSONB DEFAULT '{}',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS worker_history (
+                    id SERIAL PRIMARY KEY,
+                    worker_name TEXT NOT NULL,
+                    task_id TEXT,
+                    task_description TEXT,
+                    outcome TEXT,
+                    skills_used TEXT,
+                    summary TEXT,
+                    started_at TIMESTAMPTZ,
+                    finished_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS document_chunks (
+                    id SERIAL PRIMARY KEY,
+                    doc_path TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS document_embeddings (
+                    id SERIAL PRIMARY KEY,
+                    chunk_id INTEGER REFERENCES document_chunks(id) ON DELETE CASCADE,
+                    embedding BYTEA NOT NULL,
+                    vector_version TEXT DEFAULT '1',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_director_memory_category
+                    ON director_memory(category);
+                CREATE INDEX IF NOT EXISTS idx_worker_memory_worker
+                    ON worker_memory(worker_name);
+                CREATE INDEX IF NOT EXISTS idx_worker_history_worker
+                    ON worker_history(worker_name);
+                CREATE INDEX IF NOT EXISTS idx_conversations_created
+                    ON conversations(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_document_chunks_path
+                    ON document_chunks(doc_path);
+            """)
+
+    # ─── Tier 1: Director Memory ───────────────────────────────────────
+
+    async def remember(
+        self,
+        content: str,
+        category: str = "general",
+        metadata: dict[str, Any] | None = None,
+        embed: bool = True,
+    ) -> Memory:
+        """
+        Store a director memory (Tier 1).
+
+        Args:
+            content: The memory content
+            category: Memory category (e.g., "decision", "lesson", "fact")
+            metadata: Optional JSON metadata
+            embed: Whether to generate an embedding (default: True)
+
+        Returns:
+            The stored Memory object
+        """
+        embedding_data = None
+        embedding_model = None
+
+        if embed and not isinstance(self._embedder, NullEmbedder):
+            try:
+                vector = await self._embedder.embed(content)
+                embedding_data = serialize_vector(vector)
+                embedding_model = self._embedder.model_name
+            except Exception as e:
+                logger.warning(f"Embedding failed, storing without embedding: {e}")
+
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO director_memory (content, category, embedding, embedding_model, metadata)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, created_at
+                """,
+                content,
+                category,
+                embedding_data,
+                embedding_model,
+                metadata or {},
+            )
+
+        return Memory(
+            id=row["id"],
+            content=content,
+            category=category,
+            tier=MemoryTier.DIRECTOR,
+            metadata=metadata or {},
+            created_at=row["created_at"],
+        )
+
+    async def recall(
+        self,
+        query: str,
+        category: str | None = None,
+        limit: int = 10,
+        threshold: float = 0.4,
+    ) -> list[SearchResult]:
+        """
+        Search director memory (Tier 1). Uses semantic search with keyword fallback.
+
+        Args:
+            query: Search query
+            category: Optional category filter
+            limit: Maximum results
+            threshold: Minimum relevance score for semantic results
+
+        Returns:
+            List of SearchResult objects sorted by relevance
+        """
+        # Try semantic search first
+        if not isinstance(self._embedder, NullEmbedder):
+            try:
+                results = await self._semantic_recall(query, category, limit, threshold)
+                if results:
+                    return results
+            except Exception as e:
+                logger.warning(f"Semantic search failed, falling back to keyword: {e}")
+
+        # Keyword fallback
+        return await self._keyword_recall(query, category, limit)
+
+    async def _semantic_recall(
+        self,
+        query: str,
+        category: str | None,
+        limit: int,
+        threshold: float,
+    ) -> list[SearchResult]:
+        """Semantic search using embedding similarity."""
+        query_vector = await self._embedder.embed(query)
+        if not query_vector:
+            return []
+
+        # Fetch all memories with embeddings
+        async with self._pool.acquire() as conn:
+            if category:
+                rows = await conn.fetch(
+                    """SELECT id, content, category, embedding, metadata, created_at, updated_at
+                       FROM director_memory WHERE category = $1 AND embedding IS NOT NULL""",
+                    category,
+                )
+            else:
+                rows = await conn.fetch(
+                    """SELECT id, content, category, embedding, metadata, created_at, updated_at
+                       FROM director_memory WHERE embedding IS NOT NULL"""
+                )
+
+        results = []
+        for row in rows:
+            stored_vector = deserialize_vector(row["embedding"])
+            score = cosine_similarity(query_vector, stored_vector)
+            if score >= threshold:
+                memory = Memory(
+                    id=row["id"],
+                    content=row["content"],
+                    category=row["category"],
+                    tier=MemoryTier.DIRECTOR,
+                    metadata=dict(row["metadata"]) if row["metadata"] else {},
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+                results.append(SearchResult(memory=memory, score=score, match_type="semantic"))
+
+        results.sort(key=lambda r: r.score, reverse=True)
+        return results[:limit]
+
+    async def _keyword_recall(
+        self,
+        query: str,
+        category: str | None,
+        limit: int,
+    ) -> list[SearchResult]:
+        """Keyword fallback search — AND-style LIKE matching, sorted by recency."""
+        words = query.lower().split()
+        if not words:
+            return []
+
+        conditions = ["LOWER(content) LIKE $" + str(i + 1) for i in range(len(words))]
+        params = [f"%{w}%" for w in words]
+
+        if category:
+            conditions.append(f"category = ${len(words) + 1}")
+            params.append(category)
+
+        where = " AND ".join(conditions)
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""SELECT id, content, category, metadata, created_at, updated_at
+                    FROM director_memory
+                    WHERE {where}
+                    ORDER BY created_at DESC
+                    LIMIT {limit}""",
+                *params,
+            )
+
+        results = []
+        for i, row in enumerate(rows):
+            memory = Memory(
+                id=row["id"],
+                content=row["content"],
+                category=row["category"],
+                tier=MemoryTier.DIRECTOR,
+                metadata=dict(row["metadata"]) if row["metadata"] else {},
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            # Score by position (first = highest relevance)
+            score = 1.0 - (i * 0.05)
+            results.append(SearchResult(memory=memory, score=max(score, 0.1), match_type="keyword"))
+
+        return results
+
+    async def forget(self, memory_id: int) -> bool:
+        """Delete a specific director memory by ID."""
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM director_memory WHERE id = $1", memory_id
+            )
+            return result == "DELETE 1"
+
+    async def prune_memories(self, max_age_days: int = 90) -> int:
+        """Delete director memories older than max_age_days. Returns count deleted."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM director_memory WHERE created_at < $1", cutoff
+            )
+            count = int(result.split()[-1])
+            return count
+
+    async def get_all_memories(
+        self, category: str | None = None, limit: int = 100
+    ) -> list[Memory]:
+        """Get all director memories, optionally filtered by category."""
+        async with self._pool.acquire() as conn:
+            if category:
+                rows = await conn.fetch(
+                    """SELECT id, content, category, metadata, created_at, updated_at
+                       FROM director_memory WHERE category = $1
+                       ORDER BY created_at DESC LIMIT $2""",
+                    category,
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """SELECT id, content, category, metadata, created_at, updated_at
+                       FROM director_memory ORDER BY created_at DESC LIMIT $1""",
+                    limit,
+                )
+
+        return [
+            Memory(
+                id=row["id"],
+                content=row["content"],
+                category=row["category"],
+                tier=MemoryTier.DIRECTOR,
+                metadata=dict(row["metadata"]) if row["metadata"] else {},
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
+
+    # ─── Tier 2: Worker Shared Memory ──────────────────────────────────
+
+    async def worker_remember(
+        self,
+        worker_name: str,
+        content: str,
+        category: str = "general",
+        metadata: dict[str, Any] | None = None,
+    ) -> Memory:
+        """Store a worker shared memory (Tier 2). Name-scoped."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO worker_memory (worker_name, content, category, metadata)
+                   VALUES ($1, $2, $3, $4)
+                   RETURNING id, created_at""",
+                worker_name,
+                content,
+                category,
+                metadata or {},
+            )
+
+        return Memory(
+            id=row["id"],
+            content=content,
+            category=category,
+            tier=MemoryTier.SHARED,
+            worker_name=worker_name,
+            metadata=metadata or {},
+            created_at=row["created_at"],
+        )
+
+    async def worker_recall(
+        self,
+        worker_name: str,
+        query: str,
+        limit: int = 20,
+    ) -> list[SearchResult]:
+        """Search a worker's shared memories (Tier 2). Keyword search, name-scoped."""
+        words = query.lower().split()
+        if not words:
+            return []
+
+        conditions = ["worker_name = $1"]
+        params: list[Any] = [worker_name]
+        for i, word in enumerate(words):
+            conditions.append(f"LOWER(content) LIKE ${i + 2}")
+            params.append(f"%{word}%")
+
+        where = " AND ".join(conditions)
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""SELECT id, content, category, metadata, created_at
+                    FROM worker_memory WHERE {where}
+                    ORDER BY created_at DESC LIMIT {limit}""",
+                *params,
+            )
+
+        results = []
+        for i, row in enumerate(rows):
+            memory = Memory(
+                id=row["id"],
+                content=row["content"],
+                category=row["category"],
+                tier=MemoryTier.SHARED,
+                worker_name=worker_name,
+                metadata=dict(row["metadata"]) if row["metadata"] else {},
+                created_at=row["created_at"],
+            )
+            score = 1.0 - (i * 0.05)
+            results.append(SearchResult(memory=memory, score=max(score, 0.1), match_type="keyword"))
+
+        return results
+
+    async def worker_forget(self, worker_name: str, memory_id: int) -> bool:
+        """Delete a specific worker shared memory. Enforces name-scoping."""
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM worker_memory WHERE id = $1 AND worker_name = $2",
+                memory_id,
+                worker_name,
+            )
+            return result == "DELETE 1"
+
+    async def get_worker_memories(
+        self, worker_name: str, limit: int = 50, category: str | None = None
+    ) -> list[Memory]:
+        """Get all shared memories for a worker."""
+        async with self._pool.acquire() as conn:
+            if category:
+                rows = await conn.fetch(
+                    """SELECT id, content, category, metadata, created_at
+                       FROM worker_memory WHERE worker_name = $1 AND category = $2
+                       ORDER BY created_at DESC LIMIT $3""",
+                    worker_name,
+                    category,
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """SELECT id, content, category, metadata, created_at
+                       FROM worker_memory WHERE worker_name = $1
+                       ORDER BY created_at DESC LIMIT $2""",
+                    worker_name,
+                    limit,
+                )
+
+        return [
+            Memory(
+                id=row["id"],
+                content=row["content"],
+                category=row["category"],
+                tier=MemoryTier.SHARED,
+                worker_name=worker_name,
+                metadata=dict(row["metadata"]) if row["metadata"] else {},
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    # ─── Conversation Log ──────────────────────────────────────────────
+
+    async def log_conversation(
+        self, role: str, content: str, max_length: int = 10000
+    ) -> ConversationTurn:
+        """Log a conversation turn. Content truncated to max_length."""
+        truncated = content[:max_length] if len(content) > max_length else content
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO conversations (role, content) VALUES ($1, $2)
+                   RETURNING id, created_at""",
+                role,
+                truncated,
+            )
+        return ConversationTurn(
+            id=row["id"],
+            role=role,
+            content=truncated,
+            created_at=row["created_at"],
+        )
+
+    async def get_recent_conversations(
+        self,
+        limit: int = 20,
+        hours_window: float | None = None,
+    ) -> list[ConversationTurn]:
+        """Get recent conversation turns, optionally within a time window."""
+        async with self._pool.acquire() as conn:
+            if hours_window:
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_window)
+                rows = await conn.fetch(
+                    """SELECT id, role, content, created_at FROM conversations
+                       WHERE created_at > $1 ORDER BY created_at DESC LIMIT $2""",
+                    cutoff,
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """SELECT id, role, content, created_at FROM conversations
+                       ORDER BY created_at DESC LIMIT $1""",
+                    limit,
+                )
+
+        turns = [
+            ConversationTurn(
+                id=row["id"],
+                role=row["role"],
+                content=row["content"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+        turns.reverse()  # Chronological order
+        return turns
+
+    # ─── Worker History / Resumes ──────────────────────────────────────
+
+    async def record_task_completion(
+        self,
+        worker_name: str,
+        task_id: str,
+        description: str,
+        outcome: str,
+        skills_used: str | None = None,
+        summary: str | None = None,
+        started_at: datetime | None = None,
+    ) -> WorkerResume:
+        """Record a task completion in the worker's resume."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO worker_history
+                   (worker_name, task_id, task_description, outcome, skills_used, summary, started_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   RETURNING finished_at""",
+                worker_name,
+                task_id,
+                description,
+                outcome,
+                skills_used,
+                summary,
+                started_at,
+            )
+
+        return WorkerResume(
+            task_id=task_id,
+            description=description,
+            outcome=outcome,
+            skills_used=skills_used,
+            summary=summary,
+            started_at=started_at,
+            finished_at=row["finished_at"],
+        )
+
+    async def get_worker_resume(
+        self, worker_name: str, limit: int = 10
+    ) -> list[WorkerResume]:
+        """Get a worker's recent task history (resume)."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT task_id, task_description, outcome, skills_used, summary,
+                          started_at, finished_at
+                   FROM worker_history WHERE worker_name = $1
+                   ORDER BY finished_at DESC LIMIT $2""",
+                worker_name,
+                limit,
+            )
+
+        return [
+            WorkerResume(
+                task_id=row["task_id"],
+                description=row["task_description"],
+                outcome=row["outcome"],
+                skills_used=row["skills_used"],
+                summary=row["summary"],
+                started_at=row["started_at"],
+                finished_at=row["finished_at"],
+            )
+            for row in rows
+        ]
+
+    # ─── RAG / Document Search ─────────────────────────────────────────
+
+    async def index_document(
+        self,
+        doc_path: str,
+        chunks: list[str],
+        vector_version: str = "1",
+    ) -> int:
+        """
+        Index a document by storing its chunks and embeddings.
+
+        Args:
+            doc_path: Path or identifier for the document
+            chunks: List of text chunks
+            vector_version: Version tag for the embeddings
+
+        Returns:
+            Number of chunks indexed
+        """
+        if not chunks:
+            return 0
+
+        # Generate embeddings for all chunks
+        embeddings = []
+        if not isinstance(self._embedder, NullEmbedder):
+            try:
+                embeddings = await self._embedder.embed_batch(chunks)
+            except Exception as e:
+                logger.warning(f"Batch embedding failed for {doc_path}: {e}")
+
+        async with self._pool.acquire() as conn:
+            # Clear old chunks for this document
+            await conn.execute(
+                "DELETE FROM document_chunks WHERE doc_path = $1", doc_path
+            )
+
+            for i, chunk in enumerate(chunks):
+                # Insert chunk
+                row = await conn.fetchrow(
+                    """INSERT INTO document_chunks (doc_path, chunk_index, content)
+                       VALUES ($1, $2, $3) RETURNING id""",
+                    doc_path,
+                    i,
+                    chunk,
+                )
+                chunk_id = row["id"]
+
+                # Insert embedding if available
+                if i < len(embeddings) and embeddings[i]:
+                    await conn.execute(
+                        """INSERT INTO document_embeddings (chunk_id, embedding, vector_version)
+                           VALUES ($1, $2, $3)""",
+                        chunk_id,
+                        serialize_vector(embeddings[i]),
+                        vector_version,
+                    )
+
+        return len(chunks)
+
+    async def search_documents(
+        self,
+        query: str,
+        limit: int = 5,
+        threshold: float = 0.4,
+    ) -> list[tuple[str, str, float]]:
+        """
+        Search indexed documents using semantic similarity.
+
+        Returns:
+            List of (doc_path, chunk_content, score) tuples
+        """
+        if isinstance(self._embedder, NullEmbedder):
+            return []
+
+        try:
+            query_vector = await self._embedder.embed(query)
+        except Exception as e:
+            logger.warning(f"Document search embedding failed: {e}")
+            return []
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT c.doc_path, c.content, e.embedding
+                   FROM document_chunks c
+                   JOIN document_embeddings e ON e.chunk_id = c.id"""
+            )
+
+        results = []
+        for row in rows:
+            stored_vector = deserialize_vector(row["embedding"])
+            score = cosine_similarity(query_vector, stored_vector)
+            if score >= threshold:
+                results.append((row["doc_path"], row["content"], score))
+
+        results.sort(key=lambda x: x[2], reverse=True)
+        return results[:limit]
+
+    # ─── Tier 3: Worker Shells ─────────────────────────────────────────
+
+    def get_shell(self, worker_name: str) -> ShellStore:
+        """
+        Get or create a worker's private shell (Tier 3).
+
+        The shell is a per-worker SQLite database that provides:
+        - Private memories with importance weighting
+        - Structured knowledge entries
+        - Standing instructions
+        - Training data
+        - Task history
+        """
+        if worker_name not in self._shells:
+            db_path = self._shell_dir / f"{worker_name}.db"
+            self._shells[worker_name] = ShellStore(worker_name, str(db_path))
+        return self._shells[worker_name]
+
+    async def list_shells(self) -> list[WorkerShell]:
+        """List all worker shells in the shell directory."""
+        shells = []
+        for db_file in self._shell_dir.glob("*.db"):
+            name = db_file.stem
+            shell = self.get_shell(name)
+            await shell._ensure_init()
+            stats = await shell.stats()
+            shells.append(
+                WorkerShell(
+                    worker_name=name,
+                    db_path=str(db_file),
+                    memories_count=stats.get("memories", 0),
+                    knowledge_count=stats.get("knowledge", 0),
+                    instructions_count=stats.get("instructions", 0),
+                    tasks_completed=stats.get("tasks", 0),
+                )
+            )
+        return shells
+
+
+class ShellStore:
+    """
+    Per-worker SQLite shell (Tier 3).
+
+    Each worker gets an independent SQLite database. This IS the worker's identity —
+    portable, self-contained, and evolving across task assignments.
+    """
+
+    def __init__(self, worker_name: str, db_path: str):
+        self.worker_name = worker_name
+        self.db_path = db_path
+        self._db = None
+        self._initialized = False
+
+    async def _ensure_init(self):
+        """Lazy initialization — connect and create tables on first use."""
+        if self._initialized:
+            return
+
+        import aiosqlite
+
+        self._db = await aiosqlite.connect(self.db_path)
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA busy_timeout=5000")
+
+        await self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                category TEXT DEFAULT 'general',
+                importance REAL DEFAULT 0.5,
+                embedding BLOB DEFAULT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT,
+                confidence REAL DEFAULT 1.0,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS training_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TEXT DEFAULT (datetime('now')),
+                completed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS training_pairs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER REFERENCES training_sessions(id),
+                input TEXT NOT NULL,
+                output TEXT NOT NULL,
+                quality_score REAL DEFAULT 1.0
+            );
+
+            CREATE TABLE IF NOT EXISTS instructions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                priority INTEGER DEFAULT 0,
+                active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS task_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT,
+                description TEXT,
+                outcome TEXT,
+                summary TEXT,
+                started_at TEXT,
+                completed_at TEXT DEFAULT (datetime('now'))
+            );
+        """)
+        await self._db.commit()
+        self._initialized = True
+
+    async def close(self):
+        """Close the SQLite connection."""
+        if self._db:
+            await self._db.close()
+            self._db = None
+            self._initialized = False
+
+    # ─── Private Memories ──────────────────────────────────────────────
+
+    async def remember(
+        self,
+        content: str,
+        category: str = "general",
+        importance: float = 0.5,
+    ) -> Memory:
+        """Store a private memory with importance weighting."""
+        await self._ensure_init()
+        cursor = await self._db.execute(
+            "INSERT INTO memory (content, category, importance) VALUES (?, ?, ?)",
+            (content, category, max(0.0, min(1.0, importance))),
+        )
+        await self._db.commit()
+
+        return Memory(
+            id=cursor.lastrowid,
+            content=content,
+            category=category,
+            tier=MemoryTier.PRIVATE,
+            importance=importance,
+            worker_name=self.worker_name,
+        )
+
+    async def recall(self, query: str, limit: int = 20) -> list[SearchResult]:
+        """Keyword search over private memories."""
+        await self._ensure_init()
+        words = query.lower().split()
+        if not words:
+            return []
+
+        conditions = " AND ".join(["LOWER(content) LIKE ?" for _ in words])
+        params = [f"%{w}%" for w in words]
+
+        cursor = await self._db.execute(
+            f"""SELECT id, content, category, importance, created_at
+                FROM memory WHERE {conditions}
+                ORDER BY created_at DESC LIMIT ?""",
+            (*params, limit),
+        )
+        rows = await cursor.fetchall()
+
+        results = []
+        for i, row in enumerate(rows):
+            memory = Memory(
+                id=row[0],
+                content=row[1],
+                category=row[2],
+                tier=MemoryTier.PRIVATE,
+                importance=row[3],
+                worker_name=self.worker_name,
+            )
+            score = 1.0 - (i * 0.05)
+            results.append(SearchResult(memory=memory, score=max(score, 0.1), match_type="keyword"))
+
+        return results
+
+    async def forget(self, memory_id: int) -> bool:
+        """Delete a private memory by ID."""
+        await self._ensure_init()
+        cursor = await self._db.execute("DELETE FROM memory WHERE id = ?", (memory_id,))
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    async def get_memories(
+        self, limit: int = 50, category: str | None = None
+    ) -> list[Memory]:
+        """Get all private memories, optionally filtered by category."""
+        await self._ensure_init()
+        if category:
+            cursor = await self._db.execute(
+                """SELECT id, content, category, importance, created_at
+                   FROM memory WHERE category = ?
+                   ORDER BY importance DESC, created_at DESC LIMIT ?""",
+                (category, limit),
+            )
+        else:
+            cursor = await self._db.execute(
+                """SELECT id, content, category, importance, created_at
+                   FROM memory ORDER BY importance DESC, created_at DESC LIMIT ?""",
+                (limit,),
+            )
+        rows = await cursor.fetchall()
+
+        return [
+            Memory(
+                id=row[0],
+                content=row[1],
+                category=row[2],
+                tier=MemoryTier.PRIVATE,
+                importance=row[3],
+                worker_name=self.worker_name,
+            )
+            for row in rows
+        ]
+
+    # ─── Knowledge ─────────────────────────────────────────────────────
+
+    async def learn(
+        self,
+        topic: str,
+        content: str,
+        source: str | None = None,
+        confidence: float = 1.0,
+    ) -> int:
+        """Store a structured knowledge entry."""
+        await self._ensure_init()
+        cursor = await self._db.execute(
+            "INSERT INTO knowledge (topic, content, source, confidence) VALUES (?, ?, ?, ?)",
+            (topic, content, source, max(0.0, min(1.0, confidence))),
+        )
+        await self._db.commit()
+        return cursor.lastrowid
+
+    async def lookup(self, topic: str, limit: int = 10) -> list[dict]:
+        """Search knowledge by topic."""
+        await self._ensure_init()
+        cursor = await self._db.execute(
+            """SELECT id, topic, content, source, confidence, created_at
+               FROM knowledge WHERE LOWER(topic) LIKE ?
+               ORDER BY confidence DESC LIMIT ?""",
+            (f"%{topic.lower()}%", limit),
+        )
+        rows = await cursor.fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "topic": row[1],
+                "content": row[2],
+                "source": row[3],
+                "confidence": row[4],
+                "created_at": row[5],
+            }
+            for row in rows
+        ]
+
+    # ─── Instructions ──────────────────────────────────────────────────
+
+    async def add_instruction(self, content: str, priority: int = 0) -> int:
+        """Add a standing instruction (persists across tasks)."""
+        await self._ensure_init()
+        cursor = await self._db.execute(
+            "INSERT INTO instructions (content, priority) VALUES (?, ?)",
+            (content, priority),
+        )
+        await self._db.commit()
+        return cursor.lastrowid
+
+    async def get_instructions(self, active_only: bool = True) -> list[dict]:
+        """Get standing instructions."""
+        await self._ensure_init()
+        if active_only:
+            cursor = await self._db.execute(
+                "SELECT id, content, priority FROM instructions WHERE active = 1 ORDER BY priority DESC"
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT id, content, priority, active FROM instructions ORDER BY priority DESC"
+            )
+        rows = await cursor.fetchall()
+
+        return [
+            {"id": row[0], "content": row[1], "priority": row[2]}
+            for row in rows
+        ]
+
+    async def deactivate_instruction(self, instruction_id: int) -> bool:
+        """Deactivate a standing instruction."""
+        await self._ensure_init()
+        cursor = await self._db.execute(
+            "UPDATE instructions SET active = 0 WHERE id = ?", (instruction_id,)
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    # ─── Training ──────────────────────────────────────────────────────
+
+    async def start_training(self, topic: str) -> int:
+        """Start a self-training session."""
+        await self._ensure_init()
+        cursor = await self._db.execute(
+            "INSERT INTO training_sessions (topic) VALUES (?)", (topic,)
+        )
+        await self._db.commit()
+        return cursor.lastrowid
+
+    async def add_training_pair(
+        self,
+        session_id: int,
+        input_text: str,
+        output_text: str,
+        quality_score: float = 1.0,
+    ) -> int:
+        """Add an input/output training pair to a session."""
+        await self._ensure_init()
+        cursor = await self._db.execute(
+            "INSERT INTO training_pairs (session_id, input, output, quality_score) VALUES (?, ?, ?, ?)",
+            (session_id, input_text, output_text, quality_score),
+        )
+        await self._db.commit()
+        return cursor.lastrowid
+
+    async def complete_training(self, session_id: int) -> bool:
+        """Complete a training session."""
+        await self._ensure_init()
+        cursor = await self._db.execute(
+            "UPDATE training_sessions SET status = 'completed', completed_at = datetime('now') WHERE id = ?",
+            (session_id,),
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    # ─── Task History ──────────────────────────────────────────────────
+
+    async def record_task(
+        self,
+        task_id: str,
+        description: str,
+        outcome: str,
+        summary: str | None = None,
+        started_at: str | None = None,
+    ) -> int:
+        """Record a task in the shell's private history."""
+        await self._ensure_init()
+        cursor = await self._db.execute(
+            """INSERT INTO task_history (task_id, description, outcome, summary, started_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (task_id, description, outcome, summary, started_at),
+        )
+        await self._db.commit()
+        return cursor.lastrowid
+
+    async def get_task_history(self, limit: int = 20) -> list[dict]:
+        """Get the shell's task execution history."""
+        await self._ensure_init()
+        cursor = await self._db.execute(
+            """SELECT task_id, description, outcome, summary, started_at, completed_at
+               FROM task_history ORDER BY completed_at DESC LIMIT ?""",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+
+        return [
+            {
+                "task_id": row[0],
+                "description": row[1],
+                "outcome": row[2],
+                "summary": row[3],
+                "started_at": row[4],
+                "completed_at": row[5],
+            }
+            for row in rows
+        ]
+
+    # ─── Retention / Pruning ───────────────────────────────────────────
+
+    async def prune(self, policy: RetentionPolicy | None = None) -> int:
+        """Prune memories based on retention policy. Returns count deleted."""
+        await self._ensure_init()
+        policy = policy or RetentionPolicy()
+
+        cursor = await self._db.execute(
+            "SELECT id, content, category, importance, created_at FROM memory"
+        )
+        rows = await cursor.fetchall()
+
+        to_delete = []
+        for row in rows:
+            memory = Memory(
+                id=row[0],
+                content=row[1],
+                category=row[2],
+                tier=MemoryTier.PRIVATE,
+                importance=row[3],
+                worker_name=self.worker_name,
+                created_at=datetime.fromisoformat(row[4]) if row[4] else None,
+            )
+            if policy.should_prune(memory):
+                to_delete.append(memory.id)
+
+        if to_delete:
+            placeholders = ",".join("?" * len(to_delete))
+            await self._db.execute(
+                f"DELETE FROM memory WHERE id IN ({placeholders})", to_delete
+            )
+            await self._db.commit()
+
+        return len(to_delete)
+
+    # ─── Stats ─────────────────────────────────────────────────────────
+
+    async def stats(self) -> dict:
+        """Get shell statistics."""
+        await self._ensure_init()
+        result = {}
+
+        for table, key in [
+            ("memory", "memories"),
+            ("knowledge", "knowledge"),
+            ("instructions", "instructions"),
+            ("task_history", "tasks"),
+            ("training_sessions", "training_sessions"),
+            ("training_pairs", "training_pairs"),
+        ]:
+            cursor = await self._db.execute(f"SELECT COUNT(*) FROM {table}")
+            row = await cursor.fetchone()
+            result[key] = row[0] if row else 0
+
+        return result
