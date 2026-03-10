@@ -130,6 +130,22 @@ class GraphContext:
 
 
 @dataclass
+class TripletContext:
+    """Lightweight output of a triplet walk — entity neighborhood around a query.
+
+    Designed as a clean export for downstream consumers (e.g., Rhode's entity
+    linking layer) that want the entity neighbourhood without pulling the full
+    GraphContext shape.  Layer 1 of the three-layer recall pipeline.
+    """
+
+    query: str
+    rag_results: list  # SearchResult objects
+    triplets: list  # Triplet dicts from graph walk
+    entities: set  # normalised entity strings (lowercase, stripped)
+    entity_predicates: dict = field(default_factory=dict)  # entity -> [(predicate, related)]
+
+
+@dataclass
 class RetentionPolicy:
     """Importance-weighted retention rules for worker shell memories."""
 

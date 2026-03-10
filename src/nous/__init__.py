@@ -24,6 +24,7 @@ from nous.types import (
     MemoryTier,
     SearchResult,
     Triplet,
+    TripletContext,
     WorkerShell,
 )
 from nous.semantic_cluster import embed_and_cluster, summarize_cluster_result
@@ -67,6 +68,7 @@ __all__ = [
     "MemoryTier",
     "SearchResult",
     "Triplet",
+    "TripletContext",
     "WorkerShell",
     # Semantic clustering (REQ-NKGL-002, REQ-NKGL-003)
     "embed_and_cluster",
