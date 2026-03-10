@@ -26,16 +26,39 @@ from nous.types import (
     Triplet,
     WorkerShell,
 )
+from nous.semantic_cluster import embed_and_cluster, summarize_cluster_result
+from nous.hierarchy import (
+    Bridge,
+    BridgeDetector,
+    ClusterResult,
+    EntityCluster,
+    HierarchyEntity,
+    OlogicEmitter,
+    build_ologic,
+)
+from nous.ologic import (
+    REQUIREMENTS,
+    VALID_NODE_TYPES,
+    OlogicError,
+    OlogicValidationResult,
+    OlogicValidator,
+    ReconciliationResult,
+    reconcile_requirements,
+    validate_ologic_yaml,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
+    # Core memory
     "MemoryStore",
     "extract_search_queries",
     "ContextAssembler",
+    # Embeddings
     "EmbeddingProvider",
     "OllamaEmbedder",
     "NullEmbedder",
+    # Memory types
     "GraphContext",
     "Memory",
     "MemoryCategory",
@@ -43,4 +66,24 @@ __all__ = [
     "SearchResult",
     "Triplet",
     "WorkerShell",
+    # Semantic clustering (REQ-NKGL-002, REQ-NKGL-003)
+    "embed_and_cluster",
+    "summarize_cluster_result",
+    # Semantic hierarchy / .ologic generation (REQ-NKGL-004 through 007)
+    "Bridge",
+    "BridgeDetector",
+    "ClusterResult",
+    "EntityCluster",
+    "HierarchyEntity",
+    "OlogicEmitter",
+    "build_ologic",
+    # .ologic validator and requirement reconciler (REQ-NKGL-007)
+    "REQUIREMENTS",
+    "VALID_NODE_TYPES",
+    "OlogicError",
+    "OlogicValidationResult",
+    "OlogicValidator",
+    "ReconciliationResult",
+    "reconcile_requirements",
+    "validate_ologic_yaml",
 ]
