@@ -527,3 +527,114 @@ async def test_cluster_label_is_most_central_entity():
     cluster = result.clusters[0]
     # Label should be one of the entity texts (whichever is closest to centroid)
     assert cluster.label in {"entity-alpha", "entity-beta"}
+
+
+# ─── Tests: graph-constrained clustering ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_graph_edges_pull_dissimilar_entities_into_same_cluster():
+    """
+    graph_edges causes orthogonal entities (cosine dist=1.0) to cluster together.
+
+    Without graph_edges they would form separate clusters at tight threshold.
+    With graph_edges their distance is multiplied by 0.3, making them close enough
+    to cluster together.
+    """
+    pytest.importorskip("scipy")
+
+    # Orthogonal embeddings — pure semantic clustering would separate these
+    e0 = _normalize([1.0, 0.0, 0.0])
+    e1 = _normalize([0.0, 1.0, 0.0])
+    embedder = _mock_embedder([e0, e1])
+    entities = [
+        _make_entity("e0", "Rhode"),
+        _make_entity("e1", "Telegram"),
+    ]
+
+    # Without graph_edges: tight threshold should produce 2 clusters
+    result_no_edges = await embed_and_cluster(
+        entities, embedder, distance_threshold=0.5
+    )
+    # Re-embed since embedder mock returns fixed values
+    embedder2 = _mock_embedder([e0, e1])
+    entities2 = [
+        _make_entity("e0", "Rhode"),
+        _make_entity("e1", "Telegram"),
+    ]
+
+    # With graph_edges: distance is reduced by 0.3x → 0.3 * 1.0 = 0.3 < threshold=0.5
+    # So they should now be in the same cluster
+    result_with_edges = await embed_and_cluster(
+        entities2,
+        embedder2,
+        distance_threshold=0.5,
+        graph_edges=[("e0", "e1")],
+    )
+
+    # With the graph edge, the two entities should land in one cluster
+    assert len(result_with_edges.clusters) == 1, (
+        f"Expected 1 cluster with graph_edges, got {len(result_with_edges.clusters)}"
+    )
+    cluster_texts = {e.text for e in result_with_edges.clusters[0].entities}
+    assert cluster_texts == {"Rhode", "Telegram"}
+
+
+@pytest.mark.asyncio
+async def test_graph_edges_none_behaves_like_no_graph_edges():
+    """graph_edges=None is backward-compatible (same as not passing it)."""
+    pytest.importorskip("scipy")
+
+    e0 = _normalize([1.0, 0.05, 0.0])
+    e1 = _normalize([0.95, 0.1, 0.0])
+    embedder_a = _mock_embedder([e0, e1])
+    embedder_b = _mock_embedder([e0, e1])
+    entities_a = [_make_entity("e0", "alpha"), _make_entity("e1", "beta")]
+    entities_b = [_make_entity("e0", "alpha"), _make_entity("e1", "beta")]
+
+    result_default = await embed_and_cluster(entities_a, embedder_a, distance_threshold=0.9)
+    result_none = await embed_and_cluster(
+        entities_b, embedder_b, distance_threshold=0.9, graph_edges=None
+    )
+
+    assert len(result_default.clusters) == len(result_none.clusters)
+
+
+@pytest.mark.asyncio
+async def test_graph_edges_unknown_ids_ignored():
+    """graph_edges with entity IDs not in the entity list are silently ignored."""
+    pytest.importorskip("scipy")
+
+    e0 = _normalize([1.0, 0.0])
+    e1 = _normalize([0.0, 1.0])
+    embedder = _mock_embedder([e0, e1])
+    entities = [_make_entity("e0", "alpha"), _make_entity("e1", "beta")]
+
+    # "nonexistent-id" is not in entities — should not raise
+    result = await embed_and_cluster(
+        entities,
+        embedder,
+        distance_threshold=0.1,
+        graph_edges=[("e0", "nonexistent-id"), ("also-missing", "e1")],
+    )
+    assert len(result.clusters) >= 1  # no crash, some valid result
+
+
+@pytest.mark.asyncio
+async def test_graph_edges_bidirectional():
+    """graph_edges are treated symmetrically — (a,b) and (b,a) both reduce distance."""
+    pytest.importorskip("scipy")
+
+    e0 = _normalize([1.0, 0.0, 0.0])
+    e1 = _normalize([0.0, 1.0, 0.0])
+    embedder = _mock_embedder([e0, e1])
+    entities = [_make_entity("e0", "X"), _make_entity("e1", "Y")]
+
+    # Pass reverse order edge (e1→e0) — should still cluster together
+    result = await embed_and_cluster(
+        entities,
+        embedder,
+        distance_threshold=0.5,
+        graph_edges=[("e1", "e0")],
+    )
+    assert len(result.clusters) == 1

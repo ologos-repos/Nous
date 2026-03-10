@@ -302,10 +302,23 @@ async def visual_recall(
     entities_map: dict[str, HierarchyEntity] = {e.text: e for e in entities_list}
     apply_triplet_edges(entities_map, triplets)
 
-    # ── Step 6: Embed and cluster ──────────────────────────────────────────────
-    logger.info("visual_recall: embedding %d entities", len(entities_list))
+    # ── Step 6: Embed and cluster (graph-aware) ────────────────────────────────
+    # Extract graph edges from entity metadata for graph-constrained clustering.
+    # Graph-connected entities get their cosine distance reduced so HAC prefers
+    # keeping them in the same cluster — prevents the 24k-wide horizontal strip.
+    graph_edges: list[tuple[str, str]] = []
+    for entity in entities_list:
+        for target_id in entity.metadata.get("outputs", []):
+            graph_edges.append((entity.id, target_id))
+
+    logger.info(
+        "visual_recall: embedding %d entities, %d graph edges",
+        len(entities_list),
+        len(graph_edges),
+    )
     cluster_result = await embed_and_cluster(
-        entities_list, embedder, distance_threshold=0.7
+        entities_list, embedder, distance_threshold=0.7,
+        graph_edges=graph_edges if graph_edges else None,
     )
 
     # ── Step 7: Build .ologic YAML ────────────────────────────────────────────

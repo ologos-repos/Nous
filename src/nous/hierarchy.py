@@ -662,11 +662,20 @@ class OlogicEmitter:
         depth: int,
     ) -> None:
         """
-        Emit entity nodes, chained via outputs: to form one machine (connected component).
+        Emit entity nodes using triplet-derived edges from entity.metadata["outputs"].
 
-        Entity[0] → Entity[1] → ... → Entity[N-1]: sequential chain ensures all
-        nodes are in one connected component (one machine per cluster).
+        For each entity:
+        - If the entity has triplet-derived outputs AND those output IDs correspond
+          to entities in this cluster, use those as outputs: (preserving graph structure).
+        - If the entity has no triplet edges to other cluster members, fall back to
+          connecting to the next entity in the list (sequential chain fallback) to
+          keep the machine as a connected component per Ordinal rules.
+        - The last entity with no triplet edges gets no outputs (it's reachable
+          via incoming edges from earlier entities).
         """
+        # Build a set of entity IDs in this cluster for fast lookup
+        cluster_entity_ids: set[str] = {e.id for e in entities}
+
         for i, entity in enumerate(entities):
             node_type = (
                 entity.node_type
@@ -686,8 +695,19 @@ class OlogicEmitter:
                     f"{self._i(depth+1)}requirements: {self._yaml_list(requirements)}"
                 )
 
-            # Chain to next entity (creates machine via Union-Find connectivity)
-            if i < len(entities) - 1:
+            # Determine outputs: prefer triplet-derived edges within this cluster,
+            # fall back to sequential chain if no in-cluster triplet edges exist.
+            triplet_outputs = entity.metadata.get("outputs", [])
+            in_cluster_triplet_outputs = [
+                oid for oid in triplet_outputs if oid in cluster_entity_ids
+            ]
+
+            if in_cluster_triplet_outputs:
+                # Use actual graph edges from knowledge graph triplets
+                yaml_outputs = [f"entity-{oid}" for oid in in_cluster_triplet_outputs]
+                lines.append(f"{self._i(depth+1)}outputs: {self._yaml_list(yaml_outputs)}")
+            elif i < len(entities) - 1:
+                # Fallback: chain to next entity to keep machine as connected component
                 next_entity = entities[i + 1]
                 lines.append(f"{self._i(depth+1)}outputs: [entity-{next_entity.id}]")
 

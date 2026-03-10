@@ -195,6 +195,7 @@ async def embed_and_cluster(
     distance_threshold: float = 0.7,
     linkage_method: str = "average",
     min_cluster_size: int = 1,
+    graph_edges: list[tuple[str, str]] | None = None,
 ) -> ClusterResult:
     """
     Embed a list of HierarchyEntity objects and cluster them via HAC.
@@ -223,6 +224,12 @@ async def embed_and_cluster(
         min_cluster_size:   Minimum entities per cluster. Smaller clusters are
                             merged into the nearest (by centroid) larger cluster.
                             Default 1 (no merging).
+        graph_edges:        Optional list of (entity_id_a, entity_id_b) tuples
+                            representing direct triplet-derived graph connections.
+                            When provided, entity pairs with a direct graph edge
+                            have their cosine distance reduced by 0.3x, biasing
+                            HAC to keep graph-connected entities in the same cluster.
+                            Default None (pure semantic clustering).
 
     Returns:
         ClusterResult with:
@@ -291,6 +298,28 @@ async def embed_and_cluster(
     except Exception as exc:
         logger.error("Distance matrix computation failed: %s — single cluster", exc)
         return _single_cluster(entities)
+
+    # ── Step 3b: Apply graph-constrained distance reduction ───────────────────
+    # For entity pairs with a direct triplet edge, multiply their cosine distance
+    # by 0.3, strongly biasing HAC to cluster graph-connected entities together.
+    if graph_edges:
+        entity_id_to_idx = {entity.id: idx for idx, entity in enumerate(entities)}
+        edge_set: set[tuple[int, int]] = set()
+        for id_a, id_b in graph_edges:
+            idx_a = entity_id_to_idx.get(id_a)
+            idx_b = entity_id_to_idx.get(id_b)
+            if idx_a is not None and idx_b is not None and idx_a != idx_b:
+                # Store both directions for symmetric lookup
+                edge_set.add((min(idx_a, idx_b), max(idx_a, idx_b)))
+
+        if edge_set:
+            for i, j in edge_set:
+                dist_matrix[i, j] *= 0.3
+                dist_matrix[j, i] *= 0.3
+            logger.debug(
+                "Graph-constrained clustering: reduced distance for %d entity pairs",
+                len(edge_set),
+            )
 
     # Convert full distance matrix to condensed upper-triangle form for scipy
     n = len(entities)

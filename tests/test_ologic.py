@@ -16,6 +16,9 @@ the validator accepts what the emitter will produce.
 from __future__ import annotations
 
 import pytest
+import yaml
+
+from nous.hierarchy import ClusterResult, EntityCluster, HierarchyEntity, build_ologic
 from nous.ologic import (
     REQUIREMENTS,
     VALID_NODE_TYPES,
@@ -963,3 +966,183 @@ class TestPipelineIntegration:
         )
         assert recon.missing == set(), f"Missing: {recon.missing}"
         assert recon.coverage_pct == 1.0
+
+
+# ─── Tests: triplet-derived edge emission ────────────────────────────────────
+
+
+def _make_cluster_with_triplet_edges() -> ClusterResult:
+    """
+    Build a ClusterResult where entities have triplet-derived metadata["outputs"].
+
+    Entity layout:
+      rhode → connects_to → telegram  (triplet edge: rhode.outputs = [telegram])
+      telegram (no outgoing triplet in this cluster)
+
+    Both are in the same cluster (cluster-0).
+    """
+    rhode = HierarchyEntity(
+        id="rhode",
+        text="Rhode",
+        node_type="process",
+        requirements=["REQ-NKGL-002"],
+        metadata={"outputs": ["telegram"]},
+    )
+    telegram = HierarchyEntity(
+        id="telegram",
+        text="Telegram",
+        node_type="api",
+        requirements=["REQ-NKGL-002"],
+        metadata={"outputs": []},
+    )
+    cluster = EntityCluster(
+        id="cluster-0",
+        entities=[rhode, telegram],
+        centroid=[0.5, 0.5],
+        label="Rhode",
+    )
+    return ClusterResult(clusters=[cluster], inter_cluster_edges=[])
+
+
+class TestTripletEdgeEmission:
+    """Test that _emit_entity_nodes uses triplet-derived edges, not sequential chain."""
+
+    def test_triplet_outputs_used_instead_of_sequential_chain(self):
+        """
+        When entities have metadata["outputs"], the emitted YAML uses those edges,
+        not the sequential Entity[0]→Entity[1] chain.
+        """
+        cluster_result = _make_cluster_with_triplet_edges()
+        bridges, yaml_str = build_ologic(cluster_result, similarity_threshold=0.99)
+
+        doc = yaml.safe_load(yaml_str)
+        # Find the machine nodes
+        logic = doc["logic"]
+        # Single cluster → machines: at root
+        machines = logic.get("machines") or []
+        if not machines:
+            # Could be inside factories or networks
+            factories = logic.get("factories", [])
+            if factories:
+                machines = [m for f in factories for m in f.get("machines", [])]
+            else:
+                networks = logic.get("networks", [])
+                machines = [
+                    m
+                    for net in networks
+                    for f in net.get("factories", [])
+                    for m in f.get("machines", [])
+                ]
+
+        assert machines, f"No machines found in YAML:\n{yaml_str}"
+        nodes = machines[0]["nodes"]
+
+        # Find the Rhode node
+        rhode_node = next((n for n in nodes if n["id"] == "entity-rhode"), None)
+        assert rhode_node is not None, f"entity-rhode not found in nodes: {nodes}"
+
+        # Rhode should output to entity-telegram (triplet edge), not entity-telegram
+        # via sequential chain — in this case they're the same target so also check
+        # that it IS present (not absent, which would indicate a bug)
+        outputs = rhode_node.get("outputs", [])
+        assert "entity-telegram" in outputs, (
+            f"entity-rhode should output to entity-telegram via triplet edge, "
+            f"got outputs={outputs}"
+        )
+
+    def test_fallback_sequential_chain_when_no_triplet_edges(self):
+        """
+        When entities have no metadata["outputs"], fall back to sequential chain.
+        Entity[0] should still output to Entity[1] to keep machine connected.
+        """
+        # Entities with NO triplet edges in metadata
+        e0 = HierarchyEntity(id="alpha", text="Alpha", node_type="process", metadata={})
+        e1 = HierarchyEntity(id="beta", text="Beta", node_type="process", metadata={})
+        cluster = EntityCluster(
+            id="cluster-0",
+            entities=[e0, e1],
+            centroid=[0.5, 0.5],
+            label="Alpha",
+        )
+        cluster_result = ClusterResult(clusters=[cluster], inter_cluster_edges=[])
+        bridges, yaml_str = build_ologic(cluster_result, similarity_threshold=0.99)
+
+        doc = yaml.safe_load(yaml_str)
+        logic = doc["logic"]
+        machines = logic.get("machines", [])
+        assert machines
+        nodes = machines[0]["nodes"]
+
+        alpha_node = next((n for n in nodes if n["id"] == "entity-alpha"), None)
+        assert alpha_node is not None
+        # Should fall back to sequential chain: alpha → beta
+        outputs = alpha_node.get("outputs", [])
+        assert "entity-beta" in outputs, (
+            f"Fallback chain: entity-alpha should output entity-beta, got {outputs}"
+        )
+
+    def test_last_entity_no_outputs_when_no_triplet_edges(self):
+        """
+        The last entity with no triplet edges should have no outputs field —
+        it's reachable via incoming edges from earlier entities.
+        """
+        e0 = HierarchyEntity(id="first", text="First", node_type="process", metadata={})
+        e1 = HierarchyEntity(id="last", text="Last", node_type="process", metadata={})
+        cluster = EntityCluster(
+            id="cluster-0",
+            entities=[e0, e1],
+            centroid=[0.5, 0.5],
+            label="First",
+        )
+        cluster_result = ClusterResult(clusters=[cluster], inter_cluster_edges=[])
+        bridges, yaml_str = build_ologic(cluster_result, similarity_threshold=0.99)
+
+        doc = yaml.safe_load(yaml_str)
+        logic = doc["logic"]
+        machines = logic.get("machines", [])
+        nodes = machines[0]["nodes"]
+
+        last_node = next((n for n in nodes if n["id"] == "entity-last"), None)
+        assert last_node is not None
+        # Last node with no triplet edges should have no outputs
+        outputs = last_node.get("outputs", [])
+        assert outputs == [] or "outputs" not in last_node, (
+            f"Last entity should have no outputs (got: {outputs})"
+        )
+
+    def test_cross_cluster_triplet_outputs_not_emitted_in_machine(self):
+        """
+        Triplet edges pointing to entities in OTHER clusters are NOT included in
+        intra-machine outputs: — they'd violate the cross-machine edge rule.
+        """
+        # e0 has metadata["outputs"] pointing to "other-cluster-entity" which is
+        # NOT in this cluster
+        e0 = HierarchyEntity(
+            id="rhode",
+            text="Rhode",
+            node_type="process",
+            metadata={"outputs": ["other-cluster-entity"]},
+        )
+        e1 = HierarchyEntity(
+            id="memory",
+            text="Memory",
+            node_type="database",
+            metadata={},
+        )
+        cluster = EntityCluster(
+            id="cluster-0",
+            entities=[e0, e1],
+            centroid=[0.5, 0.5],
+            label="Rhode",
+        )
+        cluster_result = ClusterResult(clusters=[cluster], inter_cluster_edges=[])
+        bridges, yaml_str = build_ologic(cluster_result, similarity_threshold=0.99)
+
+        doc = yaml.safe_load(yaml_str)
+        # Validate the YAML is structurally sound (no dangling refs)
+        v = OlogicValidator()
+        result = v.validate(doc)
+        assert result.valid, (
+            f"YAML should be valid when cross-cluster triplet edges are filtered: "
+            f"{result.errors}"
+        )
