@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 
 class MemoryTier(str, enum.Enum):
@@ -97,6 +97,36 @@ class WorkerResume:
     summary: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+
+
+@dataclass
+class Triplet:
+    """
+    A knowledge graph triplet (subject, predicate, object).
+
+    Universal — not scoped to conversations. source_type identifies the origin
+    system ('conversation', 'memory', 'project', 'task', 'note', 'worker_resume',
+    etc.) and source_id is the ID within that system.
+    """
+
+    id: int
+    subject: str
+    predicate: str
+    object: str
+    source_type: str = "conversation"
+    source_id: str = ""
+    confidence: float = 1.0
+    created_at: Optional[str] = None
+
+
+@dataclass
+class GraphContext:
+    """Result of a graph-enhanced recall."""
+
+    rag_results: list  # SearchResult objects
+    graph_triplets: list  # Triplet objects from walk
+    discovered_turns: list  # ConversationTurn objects found via graph (source_type='conversation')
+    entities: set  # All entities encountered in the walk
 
 
 @dataclass

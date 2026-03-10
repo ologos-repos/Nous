@@ -43,10 +43,12 @@ from typing import Any
 from nous.embeddings import EmbeddingProvider, NullEmbedder
 from nous.types import (
     ConversationTurn,
+    GraphContext,
     Memory,
     MemoryTier,
     RetentionPolicy,
     SearchResult,
+    Triplet,
     WorkerResume,
     WorkerShell,
 )
@@ -275,6 +277,25 @@ class MemoryStore:
                     ON conversations(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_document_chunks_path
                     ON document_chunks(doc_path);
+            """)
+
+            # Knowledge graph triplets — universal, not scoped to conversations.
+            # source_type: 'conversation', 'memory', 'project', 'task', 'note', 'worker_resume', etc.
+            # source_id: the ID within that source system (as text to be flexible).
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS triplets (
+                    id SERIAL PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    object TEXT NOT NULL,
+                    source_type TEXT NOT NULL DEFAULT 'conversation',
+                    source_id TEXT NOT NULL DEFAULT '',
+                    confidence REAL DEFAULT 1.0,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_triplets_subject ON triplets(subject);
+                CREATE INDEX IF NOT EXISTS idx_triplets_object ON triplets(object);
+                CREATE INDEX IF NOT EXISTS idx_triplets_source ON triplets(source_type, source_id);
             """)
 
     # ─── Tier 1: Director Memory ───────────────────────────────────────
@@ -1005,6 +1026,532 @@ class MemoryStore:
 
         results.sort(key=lambda x: x[2], reverse=True)
         return results[:limit]
+
+    # ─── Knowledge Graph ───────────────────────────────────────────────
+    #
+    # Universal knowledge graph — not scoped to conversations. Any entity in
+    # Nous (memories, projects, tasks, worker resumes, notes, …) can be a
+    # triplet source. source_type identifies the origin system; source_id is
+    # the ID within that system (stored as text for flexibility).
+
+    async def store_triplets(
+        self,
+        triplets: list[tuple[str, str, str]],
+        source_type: str,
+        source_id: str,
+        confidence: float = 1.0,
+    ) -> int:
+        """
+        Batch INSERT (subject, predicate, object) triplets into the knowledge graph.
+
+        Args:
+            triplets: List of (subject, predicate, object) tuples
+            source_type: Origin system — 'conversation', 'memory', 'project',
+                         'task', 'note', 'worker_resume', etc.
+            source_id: ID within the source system (will be cast to str)
+            confidence: Confidence score for all triplets in this batch (0.0–1.0)
+
+        Returns:
+            Number of triplets inserted
+        """
+        if not triplets:
+            return 0
+
+        source_id_str = str(source_id)
+        count = 0
+        try:
+            async with self._pool.acquire() as conn:
+                for subject, predicate, obj in triplets:
+                    subject = subject.strip()
+                    predicate = predicate.strip()
+                    obj = obj.strip()
+                    if not subject or not predicate or not obj:
+                        continue
+                    await conn.execute(
+                        """
+                        INSERT INTO triplets (subject, predicate, object, source_type, source_id, confidence)
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        """,
+                        subject,
+                        predicate,
+                        obj,
+                        source_type,
+                        source_id_str,
+                        float(confidence),
+                    )
+                    count += 1
+        except Exception as e:
+            logger.error(
+                f"store_triplets failed for source_type={source_type} source_id={source_id}: {e}"
+            )
+        return count
+
+    async def decompose_turn(
+        self,
+        turn_id: int | None,
+        content: str,
+        decomposer=None,
+    ) -> list[dict]:
+        """
+        Extract triplets from a conversation turn and store them in the knowledge graph.
+
+        Convenience wrapper around decompose_text() that sets source_type='conversation'
+        and source_id=str(turn_id).
+
+        If decomposer is provided (callable), it is called with content and should
+        return a list of (subject, predicate, object) tuples. This is designed to
+        accept an LLM call from the caller — Nous stays LLM-agnostic.
+
+        If decomposer is None, a simple heuristic extractor is used as fallback.
+
+        Args:
+            turn_id: Source conversation turn ID
+            content: Text content to decompose
+            decomposer: Optional callable(content) -> list of (subject, predicate, object)
+
+        Returns:
+            List of triplet dicts (subject, predicate, object, source_type, source_id, confidence)
+        """
+        return await self.decompose_text(
+            content=content,
+            source_type="conversation",
+            source_id=str(turn_id) if turn_id is not None else "",
+            decomposer=decomposer,
+        )
+
+    async def decompose_text(
+        self,
+        content: str,
+        source_type: str,
+        source_id: str,
+        decomposer=None,
+        confidence: float = 1.0,
+    ) -> list[dict]:
+        """
+        Extract (subject, predicate, object) triplets from any text and store them.
+
+        Universal version of decompose_turn — works for any source type (memory,
+        project, task, note, worker_resume, conversation, …).
+
+        Args:
+            content: Text content to decompose
+            source_type: Origin system identifier
+            source_id: ID within that system
+            decomposer: Optional callable(content) -> list of (subject, predicate, object)
+            confidence: Confidence score for stored triplets
+
+        Returns:
+            List of triplet dicts stored
+        """
+        raw_triplets: list[tuple[str, str, str]] = []
+
+        if decomposer is not None:
+            try:
+                result = decomposer(content)
+                # Support both sync and async callables
+                if hasattr(result, "__await__"):
+                    result = await result
+                raw_triplets = [(s, p, o) for s, p, o in result if s and p and o]
+            except Exception as e:
+                logger.warning(f"decomposer callable failed, falling back to heuristic: {e}")
+                raw_triplets = self._heuristic_extract(content)
+        else:
+            raw_triplets = self._heuristic_extract(content)
+
+        await self.store_triplets(
+            raw_triplets,
+            source_type=source_type,
+            source_id=source_id,
+            confidence=confidence,
+        )
+
+        return [
+            {
+                "subject": s,
+                "predicate": p,
+                "object": o,
+                "source_type": source_type,
+                "source_id": source_id,
+                "confidence": confidence,
+            }
+            for s, p, o in raw_triplets
+        ]
+
+    def _heuristic_extract(self, content: str) -> list[tuple[str, str, str]]:
+        """
+        Simple heuristic triplet extractor — fallback when no LLM decomposer is provided.
+
+        Matches patterns like "<Subject> is/has/uses/was/are/can/will/supports/contains <Object>"
+        within each sentence. Returns deduplicated (subject, predicate, object) tuples.
+        """
+        triplets: list[tuple[str, str, str]] = []
+
+        # Split on sentence boundaries
+        sentences = re.split(r'(?<=[.!?])\s+', content.strip())
+
+        # Each pattern: (regex, subject_group, predicate_group, object_group)
+        patterns = [
+            # "X is/was/are/were/will be Y"
+            (r'\b([A-Za-z][\w\s\-]{1,30}?)\s+(is|was|are|were|will be)\s+([A-Za-z][\w\s\-]{1,40})', 1, 2, 3),
+            # "X has/have/had Y"
+            (r'\b([A-Za-z][\w\s\-]{1,30}?)\s+(has|have|had)\s+([A-Za-z][\w\s\-]{1,40})', 1, 2, 3),
+            # "X uses/supports/contains/provides/requires/includes Y"
+            (r'\b([A-Za-z][\w\s\-]{1,30}?)\s+(uses?|used|supports?|contains?|provides?|requires?|includes?)\s+([A-Za-z][\w\s\-]{1,40})', 1, 2, 3),
+            # "X can/will/should/must/may Y"
+            (r'\b([A-Za-z][\w\s\-]{1,30}?)\s+(can|will|should|must|may)\s+([A-Za-z][\w\s\-]{1,40})', 1, 2, 3),
+        ]
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) < 5:
+                continue
+            for pattern, subj_idx, pred_idx, obj_idx in patterns:
+                for match in re.finditer(pattern, sentence, re.IGNORECASE):
+                    subject = match.group(subj_idx).strip().rstrip('.,;:')
+                    predicate = match.group(pred_idx).strip()
+                    obj = match.group(obj_idx).strip().rstrip('.,;:')
+                    if len(subject) < 2 or len(obj) < 2:
+                        continue
+                    if len(subject) > 60 or len(obj) > 60:
+                        continue
+                    triplets.append((subject, predicate, obj))
+                    break  # One match per sentence per pattern
+
+        # Deduplicate (case-insensitive)
+        seen: set[tuple[str, str, str]] = set()
+        result: list[tuple[str, str, str]] = []
+        for t in triplets:
+            key = (t[0].lower(), t[1].lower(), t[2].lower())
+            if key not in seen:
+                seen.add(key)
+                result.append(t)
+
+        return result
+
+    async def walk_graph(
+        self,
+        entities: list[str],
+        hops: int = 2,
+        limit: int = 50,
+    ) -> list[dict]:
+        """
+        Walk the knowledge graph from a set of seed entities.
+
+        Performs up to `hops` SQL hops: each hop fetches all triplets where
+        subject or object matches any entity in the current frontier, then
+        expands to newly discovered entities for the next hop.
+
+        Args:
+            entities: Seed entity strings (subjects or objects to start from)
+            hops: Number of traversal hops (1–2 recommended)
+            limit: Maximum total triplets to return
+
+        Returns:
+            Deduplicated list of triplet dicts, each with keys:
+            id, subject, predicate, object, source_type, source_id, confidence, created_at
+        """
+        if not entities:
+            return []
+
+        seen_ids: set[int] = set()
+        all_triplets: list[dict] = []
+        frontier = list(entities)
+        seen_entities: set[str] = set(e.lower() for e in entities)
+
+        try:
+            async with self._pool.acquire() as conn:
+                for _hop in range(max(1, hops)):
+                    if not frontier:
+                        break
+
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT id, subject, predicate, object,
+                               source_type, source_id, confidence, created_at
+                        FROM triplets
+                        WHERE subject = ANY($1::text[]) OR object = ANY($1::text[])
+                        LIMIT {limit}
+                        """,
+                        frontier,
+                    )
+
+                    new_entities: list[str] = []
+                    for row in rows:
+                        if row["id"] in seen_ids:
+                            continue
+                        seen_ids.add(row["id"])
+                        t = {
+                            "id": row["id"],
+                            "subject": row["subject"],
+                            "predicate": row["predicate"],
+                            "object": row["object"],
+                            "source_type": row["source_type"],
+                            "source_id": row["source_id"],
+                            "confidence": row["confidence"],
+                            "created_at": row["created_at"],
+                        }
+                        all_triplets.append(t)
+
+                        # Expand frontier with newly discovered entities
+                        for entity in (row["subject"], row["object"]):
+                            if entity.lower() not in seen_entities:
+                                seen_entities.add(entity.lower())
+                                new_entities.append(entity)
+
+                    frontier = new_entities
+                    if len(all_triplets) >= limit:
+                        break
+
+        except Exception as e:
+            logger.error(f"walk_graph failed for entities={entities[:3]}: {e}")
+
+        return all_triplets[:limit]
+
+    async def get_triplets_for_source(
+        self,
+        source_type: str,
+        source_id: str | int,
+    ) -> list[dict]:
+        """
+        Get all triplets from a specific source (type + id combination).
+
+        Args:
+            source_type: Origin system ('conversation', 'memory', 'task', etc.)
+            source_id: ID within that system
+
+        Returns:
+            List of triplet dicts
+        """
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, subject, predicate, object,
+                           source_type, source_id, confidence, created_at
+                    FROM triplets
+                    WHERE source_type = $1 AND source_id = $2
+                    ORDER BY created_at
+                    """,
+                    source_type,
+                    str(source_id),
+                )
+            return [
+                {
+                    "id": row["id"],
+                    "subject": row["subject"],
+                    "predicate": row["predicate"],
+                    "object": row["object"],
+                    "source_type": row["source_type"],
+                    "source_id": row["source_id"],
+                    "confidence": row["confidence"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"get_triplets_for_source failed ({source_type}/{source_id}): {e}")
+            return []
+
+    async def get_triplets_for_turns(self, turn_ids: list[int]) -> list[dict]:
+        """
+        Get all triplets whose source is a conversation turn.
+
+        Convenience wrapper around get_triplets_for_source for the common
+        case of fetching triplets by conversation turn IDs.
+
+        Args:
+            turn_ids: List of conversation turn IDs
+
+        Returns:
+            List of triplet dicts
+        """
+        if not turn_ids:
+            return []
+
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, subject, predicate, object,
+                           source_type, source_id, confidence, created_at
+                    FROM triplets
+                    WHERE source_type = 'conversation'
+                      AND source_id = ANY($1::text[])
+                    ORDER BY created_at
+                    """,
+                    [str(tid) for tid in turn_ids],
+                )
+            return [
+                {
+                    "id": row["id"],
+                    "subject": row["subject"],
+                    "predicate": row["predicate"],
+                    "object": row["object"],
+                    "source_type": row["source_type"],
+                    "source_id": row["source_id"],
+                    "confidence": row["confidence"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"get_triplets_for_turns failed: {e}")
+            return []
+
+    async def get_entity_neighborhood(
+        self,
+        entity: str,
+        hops: int = 1,
+    ) -> list[dict]:
+        """
+        Convenience wrapper: walk the graph from a single entity.
+
+        Args:
+            entity: Starting entity string
+            hops: Number of hops (default 1)
+
+        Returns:
+            List of triplet dicts within N hops of the entity
+        """
+        return await self.walk_graph([entity], hops=hops)
+
+    async def graph_enhanced_recall(
+        self,
+        query: str,
+        category: str | None = None,
+        limit: int = 10,
+        threshold: float = 0.3,
+        hops: int = 2,
+    ) -> GraphContext:
+        """
+        Graph-enhanced memory recall: combines RAG hits with knowledge graph traversal.
+
+        Steps:
+        1. hybrid_recall() → top-N RAG hits from director memory
+        2. Collect source conversation turn IDs from those hits' metadata
+        3. Look up triplets linked to those source turns
+        4. Extract unique entities from those triplets
+        5. walk_graph() to expand the entity neighborhood
+        6. Collect additional conversation turns discovered via graph walk
+        7. Return GraphContext with RAG results + graph triplets + discovered turns
+
+        Graph-discovered results represent indirect matches — callers should
+        weight them lower than direct RAG hits (suggested: 0.6 * threshold).
+
+        Args:
+            query: Search query
+            category: Optional memory category filter
+            limit: Max RAG results
+            threshold: Minimum relevance score for RAG
+            hops: Graph traversal depth
+
+        Returns:
+            GraphContext with rag_results, graph_triplets, discovered_turns, entities
+        """
+        # Step 1: RAG hits
+        rag_results: list[SearchResult] = []
+        try:
+            rag_results = await self.hybrid_recall(
+                query, category=category, limit=limit, threshold=threshold
+            )
+        except Exception as e:
+            logger.warning(f"graph_enhanced_recall: hybrid_recall failed: {e}")
+
+        # Step 2: Collect conversation source turn IDs from RAG hit metadata
+        source_turn_ids: set[int] = set()
+        for sr in rag_results:
+            tid = sr.memory.metadata.get("source_turn_id")
+            if tid is not None:
+                try:
+                    source_turn_ids.add(int(tid))
+                except (ValueError, TypeError):
+                    pass
+
+        # Step 3: Get triplets linked to those source turns
+        initial_triplets: list[dict] = []
+        if source_turn_ids:
+            initial_triplets = await self.get_triplets_for_turns(list(source_turn_ids))
+
+        # Step 4: Extract unique entities from initial triplets
+        entities: set[str] = set()
+        for t in initial_triplets:
+            entities.add(t["subject"])
+            entities.add(t["object"])
+
+        # Step 5: Walk the graph; fallback to query entities if no seed triplets
+        graph_triplets: list[dict] = []
+        if entities:
+            graph_triplets = await self.walk_graph(list(entities), hops=hops, limit=50)
+        elif not initial_triplets:
+            # Fallback: try to seed from capitalized terms in the query
+            query_entities = [
+                m.group(0) for m in re.finditer(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', query)
+            ]
+            if query_entities:
+                graph_triplets = await self.walk_graph(query_entities, hops=hops, limit=50)
+
+        # Step 6: Collect conversation turns discovered via graph walk
+        walked_conv_ids: set[int] = set()
+        for t in graph_triplets:
+            if t.get("source_type") == "conversation" and t.get("source_id"):
+                try:
+                    walked_conv_ids.add(int(t["source_id"]))
+                except (ValueError, TypeError):
+                    pass
+        new_conv_ids = walked_conv_ids - source_turn_ids
+
+        discovered_turns: list[ConversationTurn] = []
+        if new_conv_ids:
+            try:
+                async with self._pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """
+                        SELECT id, role, content, created_at
+                        FROM conversations
+                        WHERE id = ANY($1::int[])
+                        ORDER BY created_at
+                        """,
+                        list(new_conv_ids),
+                    )
+                discovered_turns = [
+                    ConversationTurn(
+                        id=row["id"],
+                        role=row["role"],
+                        content=row["content"],
+                        created_at=row["created_at"],
+                    )
+                    for row in rows
+                ]
+            except Exception as e:
+                logger.warning(f"graph_enhanced_recall: failed to fetch discovered turns: {e}")
+
+        # Step 7: Collect all entities encountered in the walk
+        all_entities: set[str] = set()
+        for t in graph_triplets:
+            all_entities.add(t["subject"])
+            all_entities.add(t["object"])
+
+        # Convert raw dicts to Triplet objects
+        triplet_objects = [
+            Triplet(
+                id=t["id"],
+                subject=t["subject"],
+                predicate=t["predicate"],
+                object=t["object"],
+                source_type=t.get("source_type", "conversation"),
+                source_id=t.get("source_id", ""),
+                confidence=t.get("confidence", 1.0),
+                created_at=str(t["created_at"]) if t.get("created_at") else None,
+            )
+            for t in graph_triplets
+        ]
+
+        return GraphContext(
+            rag_results=rag_results,
+            graph_triplets=triplet_objects,
+            discovered_turns=discovered_turns,
+            entities=all_entities,
+        )
 
     # ─── Tier 3: Worker Shells ─────────────────────────────────────────
 

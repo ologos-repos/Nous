@@ -17,7 +17,15 @@ Quick start:
 from nous.store import MemoryStore, extract_search_queries
 from nous.context import ContextAssembler
 from nous.embeddings import EmbeddingProvider, OllamaEmbedder, NullEmbedder
-from nous.types import Memory, WorkerShell, SearchResult, MemoryCategory, MemoryTier
+from nous.types import (
+    GraphContext,
+    Memory,
+    MemoryCategory,
+    MemoryTier,
+    SearchResult,
+    Triplet,
+    WorkerShell,
+)
 
 __version__ = "0.1.0"
 
@@ -28,9 +36,11 @@ __all__ = [
     "EmbeddingProvider",
     "OllamaEmbedder",
     "NullEmbedder",
+    "GraphContext",
     "Memory",
-    "WorkerShell",
-    "SearchResult",
     "MemoryCategory",
     "MemoryTier",
+    "SearchResult",
+    "Triplet",
+    "WorkerShell",
 ]
