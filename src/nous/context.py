@@ -28,7 +28,7 @@ import logging
 from typing import Any
 
 from nous.store import MemoryStore
-from nous.types import Memory, SearchResult
+from nous.types import GraphContext, Memory, SearchResult, Triplet
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,7 @@ class ContextAssembler:
         conversation_limit: int = 5,
         include_memories: bool = True,
         include_documents: bool = True,
+        include_graph: bool = True,
         extra_sections: dict[str, str] | None = None,
     ) -> str:
         """
@@ -74,9 +75,10 @@ class ContextAssembler:
 
         This assembles:
         1. Recent conversations (sliding window)
-        2. Relevant director memories (semantic search)
+        2. Relevant director memories (semantic/hybrid search, or graph-enhanced)
         3. Relevant document chunks (RAG search)
-        4. Any extra sections provided by the caller
+        4. Knowledge graph context (when include_graph=True and a query is provided)
+        5. Any extra sections provided by the caller
 
         Args:
             query: Current query for semantic search (None = skip memory/doc search)
@@ -84,6 +86,10 @@ class ContextAssembler:
             conversation_limit: Max conversation turns to include
             include_memories: Whether to search and include relevant memories
             include_documents: Whether to search and include relevant documents
+            include_graph: Whether to use graph-enhanced recall (default True).
+                           When True and a query is provided, calls
+                           graph_enhanced_recall() instead of plain recall(),
+                           and adds a [KNOWLEDGE GRAPH CONTEXT] section.
             extra_sections: Additional named sections to include (e.g., {"KANBAN": "..."})
 
         Returns:
@@ -104,16 +110,42 @@ class ContextAssembler:
                     sections.append(("[RECENT CONTEXT]", conv_text))
                     char_budget -= len(conv_text)
 
-        # Semantic memory search
+        # Memory search — graph-enhanced or plain
         if include_memories and query:
-            results = await self._store.recall(
-                query, limit=self._search_limit
-            )
-            if results:
-                mem_text = self._format_memories(results)
-                if len(mem_text) <= char_budget:
-                    sections.append(("[MEMORY CONTEXT]", mem_text))
-                    char_budget -= len(mem_text)
+            if include_graph:
+                try:
+                    graph_context = await self._store.graph_enhanced_recall(
+                        query, limit=self._search_limit
+                    )
+                    # Include RAG hits as the memory section
+                    if graph_context.rag_results:
+                        mem_text = self._format_memories(graph_context.rag_results)
+                        if len(mem_text) <= char_budget:
+                            sections.append(("[MEMORY CONTEXT]", mem_text))
+                            char_budget -= len(mem_text)
+                    # Include graph context section
+                    if graph_context.graph_triplets or graph_context.discovered_turns:
+                        graph_text = self._format_graph_context(graph_context, char_budget)
+                        if graph_text and len(graph_text) <= char_budget:
+                            sections.append(("[KNOWLEDGE GRAPH CONTEXT]", graph_text))
+                            char_budget -= len(graph_text)
+                except Exception as e:
+                    logger.warning(
+                        f"graph_enhanced_recall failed, falling back to plain recall: {e}"
+                    )
+                    results = await self._store.recall(query, limit=self._search_limit)
+                    if results:
+                        mem_text = self._format_memories(results)
+                        if len(mem_text) <= char_budget:
+                            sections.append(("[MEMORY CONTEXT]", mem_text))
+                            char_budget -= len(mem_text)
+            else:
+                results = await self._store.recall(query, limit=self._search_limit)
+                if results:
+                    mem_text = self._format_memories(results)
+                    if len(mem_text) <= char_budget:
+                        sections.append(("[MEMORY CONTEXT]", mem_text))
+                        char_budget -= len(mem_text)
 
         # RAG document search
         if include_documents and query:
@@ -146,6 +178,7 @@ class ContextAssembler:
         resume_limit: int = 8,
         include_task_history: bool = True,
         task_history_limit: int = 10,
+        include_graph: bool = False,
         extra_sections: dict[str, str] | None = None,
     ) -> str:
         """
@@ -157,7 +190,8 @@ class ContextAssembler:
         3. Shared memories (PostgreSQL, name-scoped)
         4. Worker resume (recent task completions)
         5. Shell task history
-        6. Any extra sections (e.g., kanban board, task-specific instructions)
+        6. Knowledge graph context (optional, default off for workers)
+        7. Any extra sections (e.g., kanban board, task-specific instructions)
 
         Args:
             worker_name: The worker's identity
@@ -171,6 +205,8 @@ class ContextAssembler:
             resume_limit: Max resume entries
             include_task_history: Include shell task history
             task_history_limit: Max task history entries
+            include_graph: Whether to include graph context from shared memory
+                           (default False — off by default for workers to keep context lean)
             extra_sections: Additional sections (e.g., {"KANBAN BOARD": "...", "TASK": "..."})
 
         Returns:
@@ -235,6 +271,20 @@ class ContextAssembler:
                 if len(hist_text) <= char_budget:
                     sections.append(("[TASK HISTORY]", hist_text))
                     char_budget -= len(hist_text)
+
+        # Graph context (optional, default off for workers)
+        if include_graph and task_description:
+            try:
+                graph_context = await self._store.graph_enhanced_recall(
+                    task_description, limit=10
+                )
+                if graph_context.graph_triplets or graph_context.discovered_turns:
+                    graph_text = self._format_graph_context(graph_context, char_budget)
+                    if graph_text and len(graph_text) <= char_budget:
+                        sections.append(("[KNOWLEDGE GRAPH CONTEXT]", graph_text))
+                        char_budget -= len(graph_text)
+            except Exception as e:
+                logger.warning(f"build_worker_context: graph_enhanced_recall failed: {e}")
 
         # Extra sections
         if extra_sections:
@@ -330,6 +380,73 @@ class ContextAssembler:
                 line += f" (skills: {entry.skills_used})"
             lines.append(line)
         return "\n".join(lines)
+
+    def _format_graph_context(
+        self, graph_context: GraphContext, char_budget: int = 10000
+    ) -> str:
+        """
+        Format a GraphContext for prompt injection.
+
+        Triplets are grouped by source (source_type + source_id) for readability.
+        Discovered conversation turns are appended below the triplets.
+        Total output is kept within char_budget.
+
+        Args:
+            graph_context: The GraphContext returned by graph_enhanced_recall()
+            char_budget: Maximum characters to output
+
+        Returns:
+            Formatted string, or "" if nothing to show or budget exhausted
+        """
+        parts: list[str] = []
+        running_len = 0
+
+        # Group triplets by (source_type, source_id)
+        grouped: dict[tuple[str, str], list[Triplet]] = {}
+        for t in graph_context.graph_triplets:
+            key = (t.source_type, t.source_id)
+            grouped.setdefault(key, []).append(t)
+
+        if grouped:
+            parts.append("Triplets from knowledge graph:")
+            running_len += len(parts[-1]) + 1
+
+            for (source_type, source_id), triplets in sorted(grouped.items()):
+                label = f"  [{source_type}:{source_id}]" if source_id else f"  [{source_type}]"
+                label_line = label + "\n"
+                if running_len + len(label_line) > char_budget:
+                    break
+                parts.append(label)
+                running_len += len(label_line)
+
+                for t in triplets:
+                    line = f"    {t.subject} → {t.predicate} → {getattr(t, 'object')}"
+                    if running_len + len(line) + 1 > char_budget:
+                        break
+                    parts.append(line)
+                    running_len += len(line) + 1
+
+        # Discovered turns (from graph walk, not in original RAG hits)
+        if graph_context.discovered_turns:
+            header = "Discovered via graph walk:"
+            if running_len + len(header) + 1 <= char_budget:
+                parts.append(header)
+                running_len += len(header) + 1
+
+                for turn in graph_context.discovered_turns:
+                    content = turn.content
+                    if len(content) > 300:
+                        content = content[:300] + "..."
+                    line = f"  [{turn.role.upper()}]: {content}"
+                    if running_len + len(line) + 1 > char_budget:
+                        break
+                    parts.append(line)
+                    running_len += len(line) + 1
+
+        if not parts:
+            return ""
+
+        return "\n".join(parts)
 
     def _group_by_category(self, memories: list[Memory]) -> dict[str, list[Memory]]:
         """Group memories by category."""
