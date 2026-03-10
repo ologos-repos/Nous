@@ -35,6 +35,7 @@ from nous.hierarchy import (
     HierarchyEntity,
     OlogicEmitter,
     build_ologic,
+    build_ologic_from_cluster_result,
 )
 from nous.ologic import (
     REQUIREMENTS,
@@ -77,6 +78,7 @@ __all__ = [
     "HierarchyEntity",
     "OlogicEmitter",
     "build_ologic",
+    "build_ologic_from_cluster_result",
     # .ologic validator and requirement reconciler (REQ-NKGL-007)
     "REQUIREMENTS",
     "VALID_NODE_TYPES",
