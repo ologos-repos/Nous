@@ -27,6 +27,7 @@ from nous.types import (
     WorkerShell,
 )
 from nous.semantic_cluster import embed_and_cluster, summarize_cluster_result
+from nous.visual import visual_recall
 from nous.hierarchy import (
     Bridge,
     BridgeDetector,
@@ -70,6 +71,8 @@ __all__ = [
     # Semantic clustering (REQ-NKGL-002, REQ-NKGL-003)
     "embed_and_cluster",
     "summarize_cluster_result",
+    # Visual memory recall pipeline
+    "visual_recall",
     # Semantic hierarchy / .ologic generation (REQ-NKGL-004 through 007)
     "Bridge",
     "BridgeDetector",
