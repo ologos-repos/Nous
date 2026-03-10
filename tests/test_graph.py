@@ -1001,3 +1001,92 @@ def test_heuristic_extract_deduplicates():
     # Should only have 1 after dedup
     keys = [(t[0].lower(), t[1].lower(), t[2].lower()) for t in triplets]
     assert len(keys) == len(set(keys))
+
+
+def test_heuristic_extract_rejects_pronoun_subject():
+    """_heuristic_extract should reject sentences where subject is a pronoun like 'This'."""
+    store = _make_store()
+    content = "This is why I forgot Nous existed."
+    triplets = store._heuristic_extract(content)
+
+    subjects = [t[0] for t in triplets]
+    # "This" is in the blacklist and should be rejected
+    assert "This" not in subjects
+    assert "this" not in [s.lower() for s in subjects]
+
+
+def test_heuristic_extract_rejects_it_subject():
+    """_heuristic_extract should reject 'It is ...' sentences."""
+    store = _make_store()
+    content = "It is always visible in the system."
+    triplets = store._heuristic_extract(content)
+
+    subjects = [t[0] for t in triplets]
+    assert "It" not in subjects
+    assert "it" not in [s.lower() for s in subjects]
+
+
+def test_heuristic_extract_strips_leading_article_from_subject():
+    """_heuristic_extract should strip 'The ' from the start of captured subjects."""
+    store = _make_store()
+    # "The system prompt" should produce subject "system prompt" (lowercase — rejected)
+    # So use a proper-noun: "The PostgreSQL database is fast."
+    content = "The PostgreSQL database is fast."
+    triplets = store._heuristic_extract(content)
+
+    subjects = [t[0] for t in triplets]
+    # "The PostgreSQL" should have been stripped to "PostgreSQL"
+    # (or the whole triplet skipped if the remaining subject starts lowercase)
+    for s in subjects:
+        assert not s.lower().startswith("the "), f"Subject '{s}' still has leading article"
+
+
+def test_heuristic_extract_strips_leading_conjunction():
+    """_heuristic_extract should strip 'and the' from subjects."""
+    store = _make_store()
+    # "and the HAC dendrogram" is a sentence-fragment subject — should be rejected
+    # because after stripping "and the ", "HAC dendrogram" starts with 'H' (capital) BUT
+    # this wouldn't naturally appear at sentence-start. Simulate it:
+    content = "and the HAC dendrogram is the ontology hierarchy."
+    triplets = store._heuristic_extract(content)
+
+    subjects = [t[0] for t in triplets]
+    # The raw "and the HAC dendrogram" should NOT appear as a subject
+    for s in subjects:
+        assert not s.lower().startswith("and "), f"Subject '{s}' still has 'and' prefix"
+        assert not s.lower().startswith("the "), f"Subject '{s}' still has 'the' prefix"
+
+
+def test_heuristic_extract_truncates_overlong_object():
+    """_heuristic_extract should truncate objects longer than 30 chars."""
+    store = _make_store()
+    # Construct a sentence where the object is a long fragment
+    content = "Hermit uses instead of rolling custom memory per deployment environment."
+    triplets = store._heuristic_extract(content)
+
+    for subj, pred, obj in triplets:
+        assert len(obj) <= 30, f"Object '{obj}' exceeds 30 chars"
+
+
+def test_heuristic_extract_requires_capital_subject():
+    """_heuristic_extract should reject subjects that don't start with a capital letter."""
+    store = _make_store()
+    # "backend that Hermit" starts with lowercase 'b' after stripping any article
+    content = "backend that Hermit should use instead of rolling custom memory."
+    triplets = store._heuristic_extract(content)
+
+    subjects = [t[0] for t in triplets]
+    for s in subjects:
+        assert s[0].isupper(), f"Subject '{s}' does not start with capital letter"
+
+
+def test_heuristic_extract_keeps_valid_named_entities():
+    """_heuristic_extract should keep well-formed named-entity triplets."""
+    store = _make_store()
+    # Use predicates that are in the heuristic patterns: 'stores', 'uses'
+    content = "PostgreSQL stores conversation history. Redis uses embeddings."
+    triplets = store._heuristic_extract(content)
+
+    subjects = [t[0] for t in triplets]
+    # These are proper nouns — should be captured
+    assert any("PostgreSQL" in s for s in subjects) or any("Redis" in s for s in subjects)

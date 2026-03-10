@@ -1177,12 +1177,44 @@ class MemoryStore:
             for s, p, o in raw_triplets
         ]
 
+    # Blacklist of words that are never valid entity subjects/objects.
+    # Pronouns, determiners, and generic function words that appear as
+    # sentence-initial fragments when the regex is too greedy.
+    _ENTITY_BLACKLIST: frozenset[str] = frozenset({
+        "This", "It", "That", "Here", "There", "Everything", "Nothing",
+        "Something", "Always", "Never", "Each", "Every", "These", "Those",
+        "The", "A", "An", "We", "They", "You", "He", "She", "My", "Your",
+        "His", "Her", "Its", "Our", "Their", "What", "Which", "Who", "Whom",
+        "How", "When", "Where", "Why", "Just", "Also", "Since", "Because",
+        "Although", "However", "Therefore", "Thus", "Then", "Now", "Still",
+        "And", "But", "Or", "So", "Yet",
+    })
+
+    # Leading words to strip from captured subjects/objects before validation.
+    # Order matters — longest first so "and the" is stripped before "the".
+    _STRIP_PREFIXES: tuple[str, ...] = (
+        "and the ", "but the ", "or the ", "if the ", "since the ",
+        "when the ", "that the ", "as the ",
+        "and a ", "but a ", "or a ",
+        "and an ", "but an ",
+        "and ", "but ", "or ", "since ", "when ", "if ", "that ",
+        "the ", "a ", "an ",
+        "this ", "that ", "these ", "those ", "it ", "its ",
+    )
+
     def _heuristic_extract(self, content: str) -> list[tuple[str, str, str]]:
         """
         Simple heuristic triplet extractor — fallback when no LLM decomposer is provided.
 
         Matches patterns like "<Subject> is/has/uses/was/are/can/will/supports/contains <Object>"
         within each sentence. Returns deduplicated (subject, predicate, object) tuples.
+
+        Improvements over the original:
+        - Strips leading articles/conjunctions from subjects and objects.
+        - Rejects subjects/objects that are pure pronouns or function words.
+        - Requires subject to start with a capital letter after stripping.
+        - Tighter regex capture (≤20 chars) to avoid sentence-fragment matches.
+        - Truncates objects longer than 30 chars (likely sentence fragments).
         """
         triplets: list[tuple[str, str, str]] = []
 
@@ -1190,15 +1222,18 @@ class MemoryStore:
         sentences = re.split(r'(?<=[.!?])\s+', content.strip())
 
         # Each pattern: (regex, subject_group, predicate_group, object_group)
+        # Subject capture: lazy (≤20 chars) to avoid consuming the predicate.
+        # Object capture: greedy (≤30 chars) so multi-word objects like "a language"
+        # are captured in full rather than stopping at the first word.
         patterns = [
             # "X is/was/are/were/will be Y"
-            (r'\b([A-Za-z][\w\s\-]{1,30}?)\s+(is|was|are|were|will be)\s+([A-Za-z][\w\s\-]{1,40})', 1, 2, 3),
+            (r'\b([A-Za-z][\w\s\-]{1,20}?)\s+(is|was|are|were|will be)\s+([A-Za-z][\w\s\-]{1,30})\b', 1, 2, 3),
             # "X has/have/had Y"
-            (r'\b([A-Za-z][\w\s\-]{1,30}?)\s+(has|have|had)\s+([A-Za-z][\w\s\-]{1,40})', 1, 2, 3),
-            # "X uses/supports/contains/provides/requires/includes Y"
-            (r'\b([A-Za-z][\w\s\-]{1,30}?)\s+(uses?|used|supports?|contains?|provides?|requires?|includes?)\s+([A-Za-z][\w\s\-]{1,40})', 1, 2, 3),
+            (r'\b([A-Za-z][\w\s\-]{1,20}?)\s+(has|have|had)\s+([A-Za-z][\w\s\-]{1,30})\b', 1, 2, 3),
+            # "X uses/stores/supports/contains/provides/requires/includes Y"
+            (r'\b([A-Za-z][\w\s\-]{1,20}?)\s+(uses?|used|stores?|supports?|contains?|provides?|requires?|includes?)\s+([A-Za-z][\w\s\-]{1,30})\b', 1, 2, 3),
             # "X can/will/should/must/may Y"
-            (r'\b([A-Za-z][\w\s\-]{1,30}?)\s+(can|will|should|must|may)\s+([A-Za-z][\w\s\-]{1,40})', 1, 2, 3),
+            (r'\b([A-Za-z][\w\s\-]{1,20}?)\s+(can|will|should|must|may)\s+([A-Za-z][\w\s\-]{1,30})\b', 1, 2, 3),
         ]
 
         for sentence in sentences:
@@ -1210,10 +1245,33 @@ class MemoryStore:
                     subject = match.group(subj_idx).strip().rstrip('.,;:')
                     predicate = match.group(pred_idx).strip()
                     obj = match.group(obj_idx).strip().rstrip('.,;:')
+
+                    # Strip leading articles/conjunctions
+                    subject = self._strip_entity_prefixes(subject)
+                    obj = self._strip_entity_prefixes(obj)
+
+                    # Truncate objects that are too long (sentence fragments)
+                    if len(obj) > 30:
+                        obj = obj[:30].rsplit(' ', 1)[0]
+                    obj = obj.rstrip('.,;:').strip()
+
+                    # Reject too-short or too-long subjects/objects
                     if len(subject) < 2 or len(obj) < 2:
                         continue
-                    if len(subject) > 60 or len(obj) > 60:
+                    if len(subject) > 40 or len(obj) > 40:
                         continue
+
+                    # Require subject to start with a capital letter
+                    # (proper nouns, technical names — not sentence fragments)
+                    if not subject[0].isupper():
+                        continue
+
+                    # Reject blacklisted subjects and objects
+                    if subject in self._ENTITY_BLACKLIST:
+                        continue
+                    if obj in self._ENTITY_BLACKLIST:
+                        continue
+
                     triplets.append((subject, predicate, obj))
                     break  # One match per sentence per pattern
 
@@ -1227,6 +1285,17 @@ class MemoryStore:
                 result.append(t)
 
         return result
+
+    def _strip_entity_prefixes(self, text: str) -> str:
+        """Strip leading articles, conjunctions, and function words from entity text."""
+        lowered = text.lower()
+        for prefix in self._STRIP_PREFIXES:
+            if lowered.startswith(prefix):
+                text = text[len(prefix):]
+                lowered = text.lower()
+                # Only strip one prefix layer
+                break
+        return text.strip()
 
     async def walk_graph(
         self,

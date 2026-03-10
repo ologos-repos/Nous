@@ -69,15 +69,100 @@ def _infer_node_type(entity_text: str, triplets: list[Triplet]) -> str:
     """
     Infer node_type for an entity from triplet predicates.
 
-    Checks predicates where entity_text appears as the subject. Falls back
-    to 'process' if no matching predicate is found.
+    Checks predicates where entity_text appears as the subject first.
+    Also checks when entity_text is the object — e.g., if something
+    "stores" this entity, it should be type "database".
+    Falls back to 'process' if no matching predicate is found.
     """
+    # Object-role hints: when this entity is the object of a predicate,
+    # the predicate implies something about what this entity IS.
+    _OBJECT_PREDICATE_NODE_TYPES: dict[str, str] = {
+        "stores": "database",
+        "persists": "database",
+        "serves": "api",
+        "exposes": "api",
+        "monitors": "monitor",
+        "observes": "monitor",
+        "uses": "process",
+        "depends_on": "process",
+        "decides": "decision",
+        "routes": "decision",
+    }
+
+    # Subject role takes priority
     for triplet in triplets:
         if triplet.subject == entity_text:
             pred = triplet.predicate.lower()
             if pred in _PREDICATE_NODE_TYPES:
                 return _PREDICATE_NODE_TYPES[pred]
+
+    # Object role as fallback
+    for triplet in triplets:
+        obj = getattr(triplet, "object", None)
+        if obj == entity_text:
+            pred = triplet.predicate.lower()
+            if pred in _OBJECT_PREDICATE_NODE_TYPES:
+                return _OBJECT_PREDICATE_NODE_TYPES[pred]
+
     return "process"
+
+
+# Leading determiners/articles to strip from raw entity text scraped from triplets.
+_ENTITY_LEADING_ARTICLES = (
+    "and the ", "but the ", "or the ", "if the ", "since the ",
+    "when the ", "that the ", "as the ",
+    "and a ", "but a ", "or a ",
+    "and an ", "but an ",
+    "and ", "but ", "or ", "since ", "when ", "if ", "that ",
+    "the ", "a ", "an ",
+    "this ", "that ", "these ", "those ", "it ", "its ",
+)
+
+# Non-entity words that should never appear as standalone entity names.
+_ENTITY_BLACKLIST: frozenset[str] = frozenset({
+    "This", "It", "That", "Here", "There", "Everything", "Nothing",
+    "Something", "Always", "Never", "Each", "Every", "These", "Those",
+    "The", "A", "An", "We", "They", "You", "He", "She", "My", "Your",
+    "His", "Her", "Its", "Our", "Their", "What", "Which", "Who", "Whom",
+    "How", "When", "Where", "Why", "Just", "Also", "Since", "Because",
+    "Although", "However", "Therefore", "Thus", "Then", "Now", "Still",
+    "And", "But", "Or", "So", "Yet",
+})
+
+
+def _normalize_entity_text(text: str) -> str:
+    """
+    Normalize raw entity text from triplets:
+    - Strip leading articles/conjunctions/determiners.
+    - Strip trailing punctuation.
+    - Collapse internal whitespace.
+    """
+    text = text.strip().rstrip('.,;:')
+    lowered = text.lower()
+    for prefix in _ENTITY_LEADING_ARTICLES:
+        if lowered.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    return text
+
+
+def _is_valid_entity(text: str) -> bool:
+    """
+    Return True if the entity text is a valid named entity.
+
+    Rejects:
+    - Text shorter than 2 chars or longer than 40 chars.
+    - Blacklisted pronouns/function words.
+    - Text that doesn't start with a capital letter (sentence fragments).
+    """
+    if len(text) < 2 or len(text) > 40:
+        return False
+    if text in _ENTITY_BLACKLIST:
+        return False
+    # Entity names should start with a capital letter (proper noun or technical term)
+    if not text[0].isupper():
+        return False
+    return True
 
 
 def _extract_ner_entities(content: str) -> list[str]:
@@ -136,44 +221,62 @@ def extract_entities_from_graph(graph_context: GraphContext) -> list[HierarchyEn
     Convert a GraphContext into a list of HierarchyEntity objects.
 
     Step 1: Extract unique entity strings from graph_triplets (subjects + objects).
-    Step 2: Infer node_type from predicate patterns.
-    Step 3: Collect source_triplets for metadata.
-    Step 4: Supplement with entities from rag_results via simple NER.
+    Step 2: Normalize entity text (strip leading articles, validate length/blacklist).
+    Step 3: Case-insensitive deduplication of near-matches.
+    Step 4: Infer node_type from predicate patterns.
+    Step 5: Collect source_triplets for metadata.
+    Step 6: Supplement with entities from rag_results via simple NER.
 
     Returns a list of HierarchyEntity objects ready for embed_and_cluster().
     """
     triplets: list[Triplet] = graph_context.graph_triplets or []
     rag_results: list[SearchResult] = graph_context.rag_results or []
 
-    # Map: entity_text → list of triplets involving this entity
+    # Map: normalized_entity_text → list of triplets involving this entity
     entity_triplets: dict[str, list[Triplet]] = {}
+
+    # Case-insensitive dedup index: lowercase_text → canonical_text
+    _lower_to_canonical: dict[str, str] = {}
+
+    def _register_entity(raw_text: str, triplet: Triplet) -> None:
+        """Normalize, validate, and register an entity from a triplet."""
+        text = _normalize_entity_text(raw_text)
+        if not _is_valid_entity(text):
+            return
+        # Case-insensitive dedup: prefer the first seen casing
+        lower = text.lower()
+        if lower in _lower_to_canonical:
+            canonical = _lower_to_canonical[lower]
+        else:
+            _lower_to_canonical[lower] = text
+            canonical = text
+
+        if canonical not in entity_triplets:
+            entity_triplets[canonical] = []
+        entity_triplets[canonical].append(triplet)
 
     for triplet in triplets:
         subj = triplet.subject
         obj = getattr(triplet, "object", None)
 
         if subj:
-            if subj not in entity_triplets:
-                entity_triplets[subj] = []
-            entity_triplets[subj].append(triplet)
-
-        if obj and obj != subj:
-            if obj not in entity_triplets:
-                entity_triplets[obj] = []
-            entity_triplets[obj].append(triplet)
+            _register_entity(subj, triplet)
+        if obj:
+            _register_entity(obj, triplet)
 
     # Build HierarchyEntity for each unique entity from triplets
-    seen_texts: set[str] = set(entity_triplets.keys())
+    # Track seen slugs to avoid ID collisions
+    seen_ids: dict[str, str] = {}  # slug → entity_text
     entities_map: dict[str, HierarchyEntity] = {}
 
     for entity_text, related_triplets in entity_triplets.items():
         eid = _slugify(entity_text)
-        # If slug collision, append a suffix
         base_eid = eid
         suffix = 1
-        while eid in {e.id for e in entities_map.values()} and entities_map.get(eid) and entities_map[eid].text != entity_text:
+        while eid in seen_ids and seen_ids[eid] != entity_text:
             eid = f"{base_eid}-{suffix}"
             suffix += 1
+        seen_ids[eid] = entity_text
 
         node_type = _infer_node_type(entity_text, triplets)
 
@@ -186,6 +289,9 @@ def extract_entities_from_graph(graph_context: GraphContext) -> list[HierarchyEn
             metadata={"source_triplets": [_triplet_to_dict(t) for t in related_triplets]},
         )
 
+    # Track seen entity texts (canonical + lowercase) for NER dedup
+    seen_lowers: set[str] = {t.lower() for t in entities_map}
+
     # Supplement with entities from rag_results (simple NER)
     for result in rag_results:
         try:
@@ -194,19 +300,22 @@ def extract_entities_from_graph(graph_context: GraphContext) -> list[HierarchyEn
             continue
         ner_entities = _extract_ner_entities(content)
         for ner_text in ner_entities:
-            if ner_text in seen_texts:
+            # Normalize and validate NER entity
+            ner_text = _normalize_entity_text(ner_text)
+            if not _is_valid_entity(ner_text):
                 continue
-            seen_texts.add(ner_text)
+            if ner_text.lower() in seen_lowers:
+                continue
+            seen_lowers.add(ner_text.lower())
+
             eid = _slugify(ner_text)
-            # Handle slug collisions
             base_eid = eid
             suffix = 1
-            while eid in {e.id for e in entities_map.values()} and entities_map.get(eid + "_check") is None:
-                existing = next((e for e in entities_map.values() if e.id == eid), None)
-                if existing is None or existing.text == ner_text:
-                    break
+            while eid in seen_ids and seen_ids[eid] != ner_text:
                 eid = f"{base_eid}-{suffix}"
                 suffix += 1
+            seen_ids[eid] = ner_text
+
             entities_map[ner_text] = HierarchyEntity(
                 id=eid,
                 text=ner_text,

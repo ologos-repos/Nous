@@ -26,6 +26,8 @@ from nous.types import GraphContext, Memory, SearchResult, Triplet
 from nous.visual import (
     _extract_ner_entities,
     _infer_node_type,
+    _is_valid_entity,
+    _normalize_entity_text,
     _slugify,
     apply_triplet_edges,
     extract_entities_from_graph,
@@ -158,9 +160,14 @@ class TestInferNodeType:
         triplets = [_make_triplet(1, "Foo", "links", "Bar")]
         assert _infer_node_type("Foo", triplets) == "process"
 
-    def test_entity_as_object_not_subject_gives_default(self):
-        # "Bar" only appears as object — should default to process
+    def test_entity_as_object_of_stores_gives_database(self):
+        # "Bar" is the object of "stores" → infer it is a database
         triplets = [_make_triplet(1, "Foo", "stores", "Bar")]
+        assert _infer_node_type("Bar", triplets) == "database"
+
+    def test_entity_as_object_of_unknown_predicate_gives_process(self):
+        # "Bar" is the object of an unknown predicate → falls back to process
+        triplets = [_make_triplet(1, "Foo", "links", "Bar")]
         assert _infer_node_type("Bar", triplets) == "process"
 
     def test_empty_triplets_gives_process(self):
@@ -237,8 +244,8 @@ class TestExtractEntitiesFromGraph:
         entity_map = {e.text: e for e in result}
         # App (subject with 'stores') → database
         assert entity_map["App"].node_type == "database"
-        # Database (object) → process (default)
-        assert entity_map["Database"].node_type == "process"
+        # Database (object of 'stores') → also database (object-role inference)
+        assert entity_map["Database"].node_type == "database"
 
     def test_multiple_triplets_deduplication(self):
         triplets = [
@@ -253,13 +260,13 @@ class TestExtractEntitiesFromGraph:
         assert "ServiceA" in texts
 
     def test_source_triplets_stored_in_metadata(self):
-        triplets = [_make_triplet(1, "X", "monitors", "Y")]
+        triplets = [_make_triplet(1, "Monitor", "monitors", "ServiceA")]
         ctx = _make_graph_context(triplets=triplets)
         result = extract_entities_from_graph(ctx)
         entity_map = {e.text: e for e in result}
-        # X appears in one triplet
-        assert len(entity_map["X"].metadata["source_triplets"]) == 1
-        assert entity_map["X"].metadata["source_triplets"][0]["predicate"] == "monitors"
+        # Monitor appears in one triplet
+        assert len(entity_map["Monitor"].metadata["source_triplets"]) == 1
+        assert entity_map["Monitor"].metadata["source_triplets"][0]["predicate"] == "monitors"
 
     def test_rag_results_supplement_entities(self):
         # No triplets → entities come from NER in rag_results
@@ -447,3 +454,160 @@ class TestVisualRecallHappyPath:
         await visual_recall("auth flow", store, embedder)
 
         store.graph_enhanced_recall.assert_called_once_with("auth flow", limit=15, hops=2)
+
+
+# ---------------------------------------------------------------------------
+# _normalize_entity_text tests
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeEntityText:
+    def test_strips_leading_the(self):
+        assert _normalize_entity_text("the system") == "system"
+
+    def test_strips_leading_a(self):
+        assert _normalize_entity_text("a database") == "database"
+
+    def test_strips_leading_an(self):
+        assert _normalize_entity_text("an API") == "API"
+
+    def test_strips_leading_and_the(self):
+        assert _normalize_entity_text("and the HAC dendrogram") == "HAC dendrogram"
+
+    def test_strips_leading_since_the(self):
+        assert _normalize_entity_text("since the package") == "package"
+
+    def test_strips_trailing_punctuation(self):
+        assert _normalize_entity_text("PostgreSQL,") == "PostgreSQL"
+
+    def test_leaves_clean_proper_noun_unchanged(self):
+        assert _normalize_entity_text("PostgreSQL") == "PostgreSQL"
+
+    def test_leaves_clean_compound_unchanged(self):
+        assert _normalize_entity_text("Memory Store") == "Memory Store"
+
+    def test_strips_this_prefix(self):
+        assert _normalize_entity_text("this module") == "module"
+
+    def test_strips_it_prefix(self):
+        assert _normalize_entity_text("it works") == "works"
+
+
+# ---------------------------------------------------------------------------
+# _is_valid_entity tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsValidEntity:
+    def test_rejects_this(self):
+        assert not _is_valid_entity("This")
+
+    def test_rejects_it(self):
+        assert not _is_valid_entity("It")
+
+    def test_rejects_everything(self):
+        assert not _is_valid_entity("Everything")
+
+    def test_rejects_too_short(self):
+        assert not _is_valid_entity("A")
+
+    def test_rejects_too_long(self):
+        # 41+ chars
+        assert not _is_valid_entity("A" * 41)
+
+    def test_rejects_lowercase_start(self):
+        assert not _is_valid_entity("backend that Hermit")
+
+    def test_accepts_proper_noun(self):
+        assert _is_valid_entity("PostgreSQL")
+
+    def test_accepts_compound_name(self):
+        assert _is_valid_entity("Memory Store")
+
+    def test_accepts_two_char_entity(self):
+        # Minimum length = 2 uppercase chars
+        assert _is_valid_entity("AI")
+
+    def test_rejects_these(self):
+        assert not _is_valid_entity("These")
+
+
+# ---------------------------------------------------------------------------
+# extract_entities_from_graph — cleanup / dedup tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractEntitiesCleanup:
+    def test_normalizes_entity_with_leading_article(self):
+        # Subject "The system prompt" should normalize to "system prompt"
+        # BUT "system prompt" starts with lowercase so it gets filtered out.
+        # Use a proper-noun subject instead.
+        triplets = [_make_triplet(1, "The PostgreSQL", "stores", "Data")]
+        ctx = _make_graph_context(triplets=triplets)
+        result = extract_entities_from_graph(ctx)
+        texts = {e.text for e in result}
+        # "The PostgreSQL" normalizes to "PostgreSQL"
+        assert "PostgreSQL" in texts
+        # The raw "The PostgreSQL" should NOT be present
+        assert "The PostgreSQL" not in texts
+
+    def test_rejects_pronoun_subject(self):
+        # "This" is blacklisted — should produce 0 entities from subject side
+        triplets = [_make_triplet(1, "This", "is", "a problem")]
+        ctx = _make_graph_context(triplets=triplets)
+        result = extract_entities_from_graph(ctx)
+        texts = {e.text for e in result}
+        assert "This" not in texts
+
+    def test_deduplicates_case_insensitive(self):
+        # "Rhode" and "rhode " (trailing space + different case) should be one entity
+        triplets = [
+            _make_triplet(1, "Rhode", "uses", "PostgreSQL"),
+            _make_triplet(2, "rhode", "connects_to", "Telegram"),
+        ]
+        ctx = _make_graph_context(triplets=triplets)
+        result = extract_entities_from_graph(ctx)
+        # "rhode" doesn't start with capital, so only "Rhode" survives
+        texts = {e.text for e in result}
+        assert "Rhode" in texts
+        # "rhode" is rejected by _is_valid_entity (lowercase start)
+        assert "rhode" not in texts
+
+    def test_deduplicates_trailing_whitespace(self):
+        # "Rhode" and "Rhode " should merge to one entity
+        triplets = [
+            _make_triplet(1, "Rhode", "uses", "PostgreSQL"),
+            _make_triplet(2, "Rhode ", "connects_to", "Telegram"),
+        ]
+        ctx = _make_graph_context(triplets=triplets)
+        result = extract_entities_from_graph(ctx)
+        rhode_entities = [e for e in result if e.text == "Rhode"]
+        assert len(rhode_entities) == 1
+
+    def test_filters_very_long_entity(self):
+        # An entity name of 41 chars should be filtered out
+        long_name = "B" + "a" * 40  # 41 chars, starts with capital
+        triplets = [_make_triplet(1, long_name, "is", "Hermit")]
+        ctx = _make_graph_context(triplets=triplets)
+        result = extract_entities_from_graph(ctx)
+        texts = {e.text for e in result}
+        assert long_name not in texts
+
+    def test_filters_very_short_entity(self):
+        # A single-char entity should be filtered
+        triplets = [_make_triplet(1, "A", "is", "Hermit")]
+        ctx = _make_graph_context(triplets=triplets)
+        result = extract_entities_from_graph(ctx)
+        texts = {e.text for e in result}
+        assert "A" not in texts
+
+    def test_object_infer_node_type_database(self):
+        # "UserData" as object of "stores" → should be inferred as database
+        triplets = [_make_triplet(1, "App", "stores", "UserData")]
+        ctx = _make_graph_context(triplets=triplets)
+        result = extract_entities_from_graph(ctx)
+        entity_map = {e.text: e for e in result}
+        # App (subject "stores") → database
+        assert entity_map["App"].node_type == "database"
+        # UserData (object of "stores") → also database (new object-role inference)
+        assert entity_map["UserData"].node_type == "database"
