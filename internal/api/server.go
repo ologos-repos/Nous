@@ -10,7 +10,6 @@ import (
 
 	"github.com/ologos-repos/nous/internal/config"
 	"github.com/ologos-repos/nous/internal/embeddings"
-	"github.com/ologos-repos/nous/internal/store"
 )
 
 // ServerConfig is the per-listener config block used by Server. It mirrors the
@@ -29,7 +28,7 @@ type ServerConfig struct {
 type Server struct {
 	cfg      ServerConfig
 	defaults Defaults
-	store    *store.MemoryStore
+	store    HandlerStore
 	embedder embeddings.EmbeddingProvider
 	logger   *log.Logger
 	srv      *http.Server
@@ -62,7 +61,7 @@ func DefaultsFromConfig(c config.Config) Defaults {
 
 // NewServer wires the dependencies into a Server. logger may be nil — the
 // default *log.Logger is used in that case.
-func NewServer(cfg ServerConfig, defaults Defaults, store *store.MemoryStore, embedder embeddings.EmbeddingProvider, logger *log.Logger) *Server {
+func NewServer(cfg ServerConfig, defaults Defaults, store HandlerStore, embedder embeddings.EmbeddingProvider, logger *log.Logger) *Server {
 	if logger == nil {
 		logger = log.Default()
 	}
