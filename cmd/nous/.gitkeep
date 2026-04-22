@@ -1,0 +1,3 @@
+# Application role (Tau) owns cmd/nous/main.go — this placeholder keeps
+# the directory in version control so other roles can git-clone a working
+# skeleton before main.go exists.
