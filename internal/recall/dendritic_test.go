@@ -2,7 +2,6 @@ package recall
 
 import (
 	"context"
-	"errors"
 	"strconv"
 	"testing"
 	"time"
@@ -60,12 +59,12 @@ func (s *mockStore) GetAllTopicEmbeddings(ctx context.Context) (map[int64][][]fl
 	return s.topicEmbeds, nil
 }
 
-func (s *mockStore) GetTopic(ctx context.Context, id int64) (types.Topic, error) {
+func (s *mockStore) GetTopic(ctx context.Context, id int64) (types.Topic, bool, error) {
 	t, ok := s.topics[id]
 	if !ok {
-		return types.Topic{}, errors.New("topic not found")
+		return types.Topic{}, false, nil
 	}
-	return t, nil
+	return t, true, nil
 }
 
 func (s *mockStore) ListTopics(ctx context.Context, source types.TopicSource) ([]types.Topic, error) {
@@ -99,12 +98,12 @@ func (s *mockStore) WalkGraph(ctx context.Context, entities []string, hops, limi
 	return s.tripletsByEntity, nil
 }
 
-func (s *mockStore) GetMemoryByID(ctx context.Context, id int64) (*types.Memory, error) {
+func (s *mockStore) GetMemoryByID(ctx context.Context, id int64) (types.Memory, bool, error) {
 	m, ok := s.memories[id]
 	if !ok {
-		return nil, nil
+		return types.Memory{}, false, nil
 	}
-	return m, nil
+	return *m, true, nil
 }
 
 // ===== Helpers =====

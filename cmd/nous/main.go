@@ -201,7 +201,9 @@ func runHealth(args []string, logger *log.Logger) {
 		report.PostgresError = err.Error()
 	} else {
 		report.PostgresReachable = true
-		report.PoolConns = st.PoolSize()
+		if pool := st.Pool(); pool != nil {
+			report.PoolConns = pool.Stat().TotalConns()
+		}
 	}
 
 	embedder := mustBuildEmbedder(cfg, logger)

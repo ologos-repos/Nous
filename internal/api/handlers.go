@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -152,7 +151,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	embedCtx, cancel2 := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel2()
 	resp.EmbedderAvailable = s.embedder.IsAvailable(embedCtx)
-	resp.PGPoolConns = s.store.PoolSize()
+	if pool := s.store.Pool(); pool != nil {
+		resp.PGPoolConns = pool.Stat().TotalConns()
+	}
 
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -375,8 +376,12 @@ func (s *Server) handleGetTopic(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error(), "bad_id")
 		return
 	}
-	topic, err := s.store.GetTopic(r.Context(), id)
+	topic, found, err := s.store.GetTopic(r.Context(), id)
 	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "store_failure")
+		return
+	}
+	if !found {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("topic %d not found", id), "topic_not_found")
 		return
 	}
@@ -659,21 +664,18 @@ func (s *Server) handleWorkerMemories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := int(parseInt64Query(r, "limit", 50))
-	mems, err := s.store.GetWorkerMemories(r.Context(), name, limit)
+
+	// The storage layer doesn't expose a "list worker shared memories"
+	// method directly — WorkerRecall("") falls back to most-recent ordering,
+	// which is exactly what we want here.
+	results, err := s.store.WorkerRecall(r.Context(), name, "", limit)
 	if err != nil {
-		// Some store implementations may not have GetWorkerMemories yet — surface as 501.
-		var nf interface {
-			NotImplemented() bool
-		}
-		if errors.As(err, &nf) && nf.NotImplemented() {
-			writeError(w, http.StatusNotImplemented, "GetWorkerMemories not implemented", "not_implemented")
-			return
-		}
 		writeError(w, http.StatusInternalServerError, err.Error(), "store_failure")
 		return
 	}
-	if mems == nil {
-		mems = []types.Memory{}
+	mems := make([]types.Memory, 0, len(results))
+	for _, r := range results {
+		mems = append(mems, r.Memory)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"worker_name": name,

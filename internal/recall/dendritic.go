@@ -28,10 +28,14 @@ import (
 // Store is the minimal interface DendriticRecall requires from the storage
 // layer. It is satisfied by *store.MemoryStore but kept narrow so the recall
 // package is easy to test with mocks.
+//
+// All "lookup-or-miss" methods follow the (value, found, error) pattern used
+// by the storage package: a not-found row returns (zero, false, nil) so
+// callers don't have to inspect error strings.
 type Store interface {
 	// Topic routing
 	GetAllTopicEmbeddings(ctx context.Context) (map[int64][][]float32, error)
-	GetTopic(ctx context.Context, id int64) (types.Topic, error)
+	GetTopic(ctx context.Context, id int64) (types.Topic, bool, error)
 	ListTopics(ctx context.Context, source types.TopicSource) ([]types.Topic, error)
 
 	// Within-topic and global hybrid search
@@ -40,7 +44,7 @@ type Store interface {
 
 	// Graph walk + memory lookup
 	WalkGraph(ctx context.Context, entities []string, hops, limit int) ([]types.Triplet, error)
-	GetMemoryByID(ctx context.Context, id int64) (*types.Memory, error)
+	GetMemoryByID(ctx context.Context, id int64) (types.Memory, bool, error)
 }
 
 // Defaults applied when a DendriticRecallRequest leaves a field at its zero
@@ -144,8 +148,11 @@ func RouteTopics(
 			continue
 		}
 
-		topic, err := store.GetTopic(ctx, topicID)
+		topic, found, err := store.GetTopic(ctx, topicID)
 		if err != nil {
+			return nil, queryVec, fmt.Errorf("get topic %d: %w", topicID, err)
+		}
+		if !found {
 			// Topic was deleted between GetAllTopicEmbeddings and now — skip it.
 			continue
 		}
@@ -301,13 +308,13 @@ func ExpandViaGraph(
 		}
 		seenMem[memID] = struct{}{}
 
-		mem, err := store.GetMemoryByID(ctx, memID)
-		if err != nil || mem == nil {
+		mem, found, err := store.GetMemoryByID(ctx, memID)
+		if err != nil || !found {
 			continue
 		}
 
 		crossTopic = append(crossTopic, types.ScoredMemory{
-			Memory:         *mem,
+			Memory:         mem,
 			DendriticScore: graphScore,
 			MatchType:      "graph",
 			ViaTopic:       []string{},
