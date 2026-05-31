@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # ── Resolve tag ────────────────────────────────────────────────────────
+      - name: Get tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "TAG=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Go build (runs only if go.mod is present) ─────────────────────────
+      - name: Set up Go
+        if: hashFiles('go.mod') != ''
+        run: |
+          GO_VERSION="$(awk '/^go /{print $2; exit}' go.mod)"
+          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | sudo tar -C /usr/local -xz
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+
+      - name: Build Go binaries
+        if: hashFiles('go.mod') != ''
+        run: |
+          TAG=${{ steps.tag.outputs.TAG }}
+          BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          GO_MODULE=$(awk '/^module /{print $2}' go.mod)
+
+          # Discover binary name and build target
+          if ls cmd/ 2>/dev/null | grep -q .; then
+            GO_BINARY=$(ls cmd/ | head -1)
+            BUILD_TARGET="./cmd/${GO_BINARY}"
+          else
+            GO_BINARY=$(basename "$GO_MODULE")
+            BUILD_TARGET="."
+          fi
+
+          LDFLAGS="-s -w -X ${GO_MODULE}/internal/version.Version=${TAG} -X ${GO_MODULE}/internal/version.BuildTime=${BUILD_TIME}"
+
+          echo "Building ${GO_BINARY} for linux/darwin × amd64/arm64..."
+          for OS in linux darwin; do
+            for ARCH in amd64 arm64; do
+              OUTPUT="${GO_BINARY}-${OS}-${ARCH}"
+              echo "  → ${OUTPUT}"
+              CGO_ENABLED=0 GOOS=${OS} GOARCH=${ARCH} go build \
+                -ldflags "${LDFLAGS}" \
+                -o "${OUTPUT}" \
+                "${BUILD_TARGET}"
+            done
+          done
+
+          sha256sum ${GO_BINARY}-linux-amd64 ${GO_BINARY}-linux-arm64 \
+                    ${GO_BINARY}-darwin-amd64 ${GO_BINARY}-darwin-arm64 \
+            > checksums-go.txt
+
+          echo "GO_BINARY=${GO_BINARY}" >> $GITHUB_ENV
+
+      # ── Python build (runs only if pyproject.toml is present) ─────────────
+      - name: Set up Python + uv
+        if: hashFiles('pyproject.toml') != ''
+        run: |
+          pip install uv --quiet
+
+      - name: Build Python wheel + sdist
+        if: hashFiles('pyproject.toml') != ''
+        run: |
+          TAG=${{ steps.tag.outputs.TAG }}
+          VERSION_PLAIN="${TAG#v}"   # strip leading 'v' for PEP 440
+
+          mkdir -p dist
+          uv build --out-dir dist .
+
+          (cd dist && sha256sum ./*.whl ./*.tar.gz > checksums-python.txt)
+
+          echo "Built artifacts:"
+          ls -lh dist/
+
+      # ── Wait for release (created by scripts/release.sh before CI fires) ──
+      - name: Wait for GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${{ steps.tag.outputs.TAG }}
+          for i in $(seq 1 12); do
+            if gh release view "${TAG}" --json tagName -q .tagName 2>/dev/null; then
+              echo "Release ${TAG} found"
+              break
+            fi
+            echo "Waiting for release ${TAG}... (attempt $i/12)"
+            sleep 5
+          done
+
+      # ── Upload all artifacts to the GitHub release ─────────────────────────
+      - name: Upload artifacts to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${{ steps.tag.outputs.TAG }}
+
+          # Upload Go binaries (if built)
+          if [[ -n "${GO_BINARY:-}" ]]; then
+            # Delete any stale assets first
+            for asset in "${GO_BINARY}-linux-amd64" "${GO_BINARY}-linux-arm64" \
+                          "${GO_BINARY}-darwin-amd64" "${GO_BINARY}-darwin-arm64" \
+                          "checksums-go.txt"; do
+              gh release delete-asset "${TAG}" "${asset}" --yes 2>/dev/null || true
+            done
+
+            gh release upload "${TAG}" \
+              "${GO_BINARY}-linux-amd64" \
+              "${GO_BINARY}-linux-arm64" \
+              "${GO_BINARY}-darwin-amd64" \
+              "${GO_BINARY}-darwin-arm64" \
+              checksums-go.txt \
+              --clobber
+          fi
+
+          # Upload Python artifacts (if built)
+          if ls dist/*.whl dist/*.tar.gz 2>/dev/null | grep -q .; then
+            for asset in "checksums-python.txt"; do
+              gh release delete-asset "${TAG}" "${asset}" --yes 2>/dev/null || true
+            done
+
+            gh release upload "${TAG}" dist/*.whl dist/*.tar.gz dist/checksums-python.txt --clobber
+          fi

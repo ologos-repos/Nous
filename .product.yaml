@@ -1,0 +1,5 @@
+product: Nous
+product_id: 87
+org: hermit-org
+repo: Nous
+description: Persistent agent memory architecture — three-tier memory, hybrid PostgreSQL+SQLite, embedded vector retrieval, multi-agent isolation.
